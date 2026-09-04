@@ -1,0 +1,23 @@
+*.egg-info/
+build/
+
+*.pyc
+__pycache__/
+.idea
+venv
+dist
+
+# Local experiment output and compiled artifacts
+*.pt
+*.jsonl
+*.tsv
+*.out
+*.pid
+*.log
+results/
+run-logs/
+python-target-*/
+exllamav3_ext*.so*
+
+# produced by `pip install -e .`
+exllamav3_ext.cpython-*.so
