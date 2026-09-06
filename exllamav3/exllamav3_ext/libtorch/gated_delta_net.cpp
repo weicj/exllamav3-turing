@@ -292,16 +292,17 @@ void BC_GatedDeltaNetSplit::run_bszN
         if (!disable_bc_gdn_graph())
         {
             s.graph->ready_to_record = true;
-            graph_state_size = (int) conv_state.size(2);
-            graph_hist_stride = (int) recurrent_state.size(1);
+            s.graph_state_size = (int) conv_state.size(2);
+            s.graph_hist_stride = (int) recurrent_state.size(1);
         }
         return;
     }
 
     // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
-    // so a cache with different dimensions falls back to the eager path
-    if ((int) conv_state.size(2) != graph_state_size ||
-        (int) recurrent_state.size(1) != graph_hist_stride)
+    // so a cache with different dimensions falls back to the eager path. The snapshot is per
+    // slot: another slot's eager run against a second cache must not change this replay geometry.
+    if ((int) conv_state.size(2) != s.graph_state_size ||
+        (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         return;
@@ -510,15 +511,16 @@ void BC_Mamba2::run_bszN
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         s.graph->ready_to_record = true;
-        graph_state_size = (int) conv_state.size(2);
-        graph_hist_stride = (int) recurrent_state.size(1);
+        s.graph_state_size = (int) conv_state.size(2);
+        s.graph_hist_stride = (int) recurrent_state.size(1);
         return;
     }
 
     // The captured graph bakes in the state-buffer geometry (scalar kernel args can't be patched),
-    // so a cache with different dimensions falls back to the eager path
-    if ((int) conv_state.size(2) != graph_state_size ||
-        (int) recurrent_state.size(1) != graph_hist_stride)
+    // so a cache with different dimensions falls back to the eager path. The snapshot is per
+    // slot: another slot's eager run against a second cache must not change this replay geometry.
+    if ((int) conv_state.size(2) != s.graph_state_size ||
+        (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
         run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
         return;
