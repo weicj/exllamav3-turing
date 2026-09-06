@@ -24,6 +24,22 @@ _attn_subtrace_calls = {}
 _attn_subtrace_current_calls = {}
 _cache_trace = os.environ.get("EXL3_CACHE_TRACE", "0") == "1"
 _cache_trace_layer = int(os.environ.get("EXL3_CACHE_TRACE_LAYER", "3"))
+_qsa_policy_trace_seen = set()
+
+
+def qsa_prefill_dense_enabled(seqlen: int) -> bool:
+    """Whether a long QSA cached prefill should use dense attention.
+
+    QSA's gathered implementation is the model-default above its selection threshold, but
+    it is not a good prefill kernel on SM75.  This opt-in keeps QSA's raw and pooled-key
+    planes current, then lets the ordinary dense dispatcher select FlashInfer.  It is
+    deliberately restricted to shapes larger than the BC decode graph limit, so the
+    following one-token decode still uses the graph-captured sparse path.
+    """
+    return (
+        seqlen > _bc_max_qlen and
+        os.environ.get("EXL3_QSA_PREFILL_DENSE", "0").lower() in ("1", "true", "yes", "on")
+    )
 
 
 def _save_attn_subtrace(module, stage: str, tensor: torch.Tensor | None):
@@ -1002,14 +1018,27 @@ class Attention(Module):
         qsa_layer = None
         qsa_seqlens_cpu = None
         qsa_sparse_disabled = os.environ.get("EXL3_QSA_DISABLE_SPARSE", "0") != "0"
+        qsa_dense_prefill = qsa_prefill_dense_enabled(seqlen)
         if self.qsa_indexer is not None:
             from ..cache import CacheLayer as _CL
             qsa_layer = cache if isinstance(cache, _CL) else cache.layers[self.layer_idx, params.get("layer_instance") or 0]
             qsa_seqlens_cpu = get_for_device(params, "cache_seqlens", "cpu")
             qsa_sparse = (
                 not qsa_sparse_disabled
+                and not qsa_dense_prefill
                 and int(qsa_seqlens_cpu.max().item()) + seqlen > self.qsa_indexer.sparse_threshold()
             )
+            if os.environ.get("EXL3_QSA_TRACE", "0") != "0":
+                trace_key = (id(self), seqlen, qsa_sparse, qsa_dense_prefill, qsa_sparse_disabled)
+                if trace_key not in _qsa_policy_trace_seen:
+                    _qsa_policy_trace_seen.add(trace_key)
+                    print(
+                        f"QSA_POLICY layer={self.layer_idx} q_len={seqlen} "
+                        f"cache_len={int(qsa_seqlens_cpu.max().item())} "
+                        f"dense_prefill={qsa_dense_prefill} sparse={qsa_sparse} "
+                        f"sparse_disabled={qsa_sparse_disabled}",
+                        flush = True,
+                    )
 
         # Graph-captured C++ path for the whole decode attention block (causality is baked
         # into the slot kernels, so non-causal callers like the DFlash draft graph too)

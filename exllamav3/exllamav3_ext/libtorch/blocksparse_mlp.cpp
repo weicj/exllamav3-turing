@@ -342,7 +342,25 @@ void BC_BlockSparseMLP::run_bszN
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
             if (down_bias_ptrs) patch_bias();
-            args.push_back(PPTR(GP_mgemm_A,                     x_dense_ptr));
+            if (shared_experts->gu_ptrs_trellis)
+            {
+                // Fused shared gate/up MGEMM: only the input pointer is dynamic.
+                args.push_back(PPTR(GP_mgemm_A,                 x_dense_ptr));
+            }
+            else
+            {
+                // Separate shared gate/up GEMVs record two input/output pairs before
+                // their down projection. Their static output pointers still have to
+                // occur in this type-ordered sequence, or Graph::launch stops before
+                // reaching the following shared-gate patch sites.
+                at::Tensor& shared_gu = shared_experts->gu_cache[graphidx];
+                TORCH_CHECK(shared_gu.defined(), "shared-expert graph scratch is not initialized");
+                args.push_back(PPTR(GP_gemm_A,                  x_dense_ptr));
+                args.push_back(PPTR(GP_gemm_C,                  (void*) shared_gu.select(0, 0).data_ptr()));
+                args.push_back(PPTR(GP_gemm_A,                  x_dense_ptr));
+                args.push_back(PPTR(GP_gemm_C,                  (void*) shared_gu.select(0, 1).data_ptr()));
+                args.push_back(PPTR(GP_gemm_C,                  (void*) out_d_sh.value().data_ptr()));
+            }
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_y,     x_dense_ptr));
             args.push_back(PPTR(GP_add_sigmoid_gate_proj_z,     (void*) out_d.data_ptr()));
         }
@@ -352,7 +370,20 @@ void BC_BlockSparseMLP::run_bszN
             args.push_back(PPTR(GP_mgemm_weights,               (void*) routing_weights.data_ptr()));
             args.push_back(PPTR(GP_end,                         nullptr));
             if (down_bias_ptrs) patch_bias();
-            args.push_back(PPTR(GP_mgemm_A,                     x_dense_ptr));
+            if (shared_experts->gu_ptrs_trellis)
+            {
+                args.push_back(PPTR(GP_mgemm_A,                 x_dense_ptr));
+            }
+            else
+            {
+                at::Tensor& shared_gu = shared_experts->gu_cache[graphidx];
+                TORCH_CHECK(shared_gu.defined(), "shared-expert graph scratch is not initialized");
+                args.push_back(PPTR(GP_gemm_A,                  x_dense_ptr));
+                args.push_back(PPTR(GP_gemm_C,                  (void*) shared_gu.select(0, 0).data_ptr()));
+                args.push_back(PPTR(GP_gemm_A,                  x_dense_ptr));
+                args.push_back(PPTR(GP_gemm_C,                  (void*) shared_gu.select(0, 1).data_ptr()));
+                args.push_back(PPTR(GP_gemm_C,                  (void*) out_d_sh.value().data_ptr()));
+            }
             args.push_back(PPTR(GP_add_x,                       (void*) out_d.data_ptr()));
             args.push_back(PPTR(GP_add_z,                       (void*) out_d.data_ptr()));
         }

@@ -319,6 +319,11 @@ void perform_cpu_reduce_avx2
         }
 
         uint32_t rem_devices = device_mask;
+        static const bool deterministic = [] {
+            const char* e = getenv("EXL3_TP_DETERMINISTIC_REDUCE");
+            return e && strcmp(e, "0") != 0;
+        }();
+        bool arrived_contrib[MAX_DEVICES] = {};
         bool first_contribution = true;
         int timeout_spin = 0;
         while (true)
@@ -333,8 +338,9 @@ void perform_cpu_reduce_avx2
                 if (cpusum_device_arrived(ctx, device, stage, multi, &no_contrib))
                 {
                     rem_devices &= ~(1 << device);
+                    arrived_contrib[device] = !no_contrib;
 
-                    if (!no_contrib)
+                    if (!deterministic && !no_contrib)
                     {
                         uint8_t* src = host_ptr(device, stage);
                         uint8_t* dst = host_ptr(MAX_DEVICES, stage);
@@ -380,6 +386,29 @@ void perform_cpu_reduce_avx2
                 {
                     printf(" ## CPU reduce process timeout\n");
                     TORCH_CHECK(false, "CPU reduce process timeout");
+                }
+            }
+        }
+
+        // Optional deterministic mode: wait for every rank above, then fold contributions
+        // in rank order. The normal path intentionally folds as ranks arrive to minimize
+        // latency; that arrival order is not numerically stable for BF16 wire reductions.
+        if (deterministic)
+        {
+            uint8_t* dst = host_ptr(MAX_DEVICES, stage);
+            bool have = false;
+            for (int device = 0; device < MAX_DEVICES; ++device)
+            {
+                if (!arrived_contrib[device]) continue;
+                uint8_t* src = host_ptr(device, stage);
+                if (!have) { memcpy(dst, src, stage_size); have = true; }
+                else
+                {
+                    size_t elem_count = CEIL_DIVIDE(stage_size, 64) * 32;
+                    if (wire_dtype == REDUCE_WIRE_FP16)
+                        fp16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, elem_count);
+                    else
+                        bf16_add_inplace_avx2((uint16_t*) dst, (uint16_t*) src, elem_count);
                 }
             }
         }

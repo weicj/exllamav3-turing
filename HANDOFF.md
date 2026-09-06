@@ -1,14 +1,108 @@
 # ExLlamaV3-Turing handoff
 
-更新时间：2026-09-04  
+更新时间：2026-09-06
 目的：在两张 22 GiB RTX 2080 Ti（Turing，SM75）上运行
 `turboderp/Qwen3.8-Flash-Next-exl3/2.05bpw_h4_ng4`，并修复 TP2 的质量漂移。
 
 ## 当前结论
 
-这个仓库是当前实验代码的独立、可追踪基线，不代表质量问题已经解决。
-模型可以在两张 2080 Ti 上通过 EXL3 TP2 加载和生成，但在相同输入、空 cache、空 recurrent state、greedy 解码的重复运行中，输出 token/hash 不稳定。
-目前没有证据表明单纯的 PLE、FlashInfer、NCCL ack 或 CUDA 异步返回是唯一根因。
+当前阶段性质量基线已经单独固化在
+[`QUALITY_BASELINE.md`](QUALITY_BASELINE.md)。该基线明确区分质量关和性能关：TP2
+质量已通过，`>1000 / >50 tok/s` 性能目标仍未通过。后续实验必须保留该文件记录的
+配置、token hash 和结果目录，不得用未验收的性能 A/B 覆盖它。
+
+### 2026-09-05 TP2/PP2 通信定位更新
+
+同一台双 RTX 2080 Ti、同一 Qwen3.8 Flash-Next EXL3、同一 4K/128 基准下，当前
+NCCL TP2 约 24 tok/s decode，而 PP2 layer split 约 38 tok/s。把 TP backend 临时换成
+项目原生 CPU-assisted reduce 后，decode 达到约 36 tok/s，已经接近 PP2；这证明瓶颈
+不是 NVLink 带宽不足，也不是 TP 拆分在硬件上必然慢，而是 NCCL 小 collective 的调用
+和同步编排开销。
+
+NCCL profile 显示 TP2 decode 每个 rank 约 13,056 次 `float32:2560` all-reduce，约
+102 次/token，累计 host 发起时间约 1.3--1.4 s（128-token 窗口）。这些是大量小消息，
+受 Python/NCCL launch 和同步延迟支配，无法体现 NVLink 的大块带宽。NCCL 日志确认实际
+走的是两张 2080 Ti 的 NVLink P2P/CUMEM（NVL 40 GB/s aggregate），不存在误走 PCIe
+的证据。
+
+原生 backend 的 36 tok/s 目前不能直接作为生产修复：它的 FP32 residual 使用 BF16 wire，
+并且默认按 rank 到达顺序做 CPU 累加；连续 fresh-state 质量 probe 仍不稳定。已加入诊断
+开关 `EXL3_TP_SYNC_AFTER_CALL`、`EXL3_TP_ASYNC_ALLREDUCE` 和
+`EXL3_TP_DETERMINISTIC_REDUCE`，默认不改变现有行为。下一步应将 native 的低延迟通信
+思路迁移到保持 FP32/确定性语义的实现，或重构 NCCL 路径以批量/图化小归约，而不是继续
+调 NVLink 带宽参数。
+
+### 性能优先的实验顺序
+
+后续实验先固定同一源码、同一 TP2 拓扑、同一 chunk/cache 和同一计时口径，建立
+prefill/decode kernel 矩阵；质量修复放在性能候选确定之后。当前保留 `int8 GEMV` 作为
+decode 主候选，不因 QSA sparse 的 SM75 回退而删除。每轮必须记录 `EXL3_BC_ATTN`、
+`EXL3_INT8_GEMV`、QSA 开关、FlashInfer workspace 及 chunk 参数。
+
+现有日志中，`~992 tok/s prefill` 与 `~16.4 tok/s decode` 来自 QSA sparse 关闭的 dense
+attention；另一组约 `~842 tok/s prefill` 与 `~24.0 tok/s decode` 来自不同的质量 probe
+口径。尚无同一源码、同一口径下同时达到 `~1000/~25` 的可采信结果，因此该数字暂作为
+待复现实验目标，而不是当前基线。
+
+这个仓库是当前实验代码的独立、可追踪基线。Qwen4Exp 已默认允许 TP，并将已验证的
+`expert_sum` MoE 确定性归约自动应用到 TP worker；`EXL3_MOE_DETERMINISTIC_REDUCE=0/1`
+仍可显式覆盖。根因是 fused MoE 的浮点 `atomicAdd` 归约顺序漂移，而不是 PLE、FlashInfer
+或 NCCL ack 的单独失效。
+
+截至 2026-09-05，在两张目标 RTX 2080 Ti 上，未设置任一 `EXL3_MOE_DETERMINISTIC_*`
+变量的 4K fresh-state 真实检索题已完成两组各 8 次验证。dense-prefill
+(`EXL3_QSA_PREFILL_DENSE=1 EXL3_FLASHINFER_WORKSPACE_MB=128`) 与默认 QSA sparse prefill
+均为 8/8 相同 token hash，均输出 `cobalt blue` 并由 `248046` 正常 EOS。质量验收已通过；
+性能仍未达到项目目标，必须使用统一基准继续优化。
+
+这里的 8/8 是各自配置内部的可重复性和检索可读性，不证明 dense-prefill 与原始 sparse
+QSA 逐 token 等价。后续同输入随机 4K benchmark 已检出二者 hash 不同，见下方功耗修复后
+重测；生产候选必须同时满足内部稳定和 sparse 基线 token 一致。
+
+### SM75 性能策略（实验性）
+
+QSA 的 sparse gathered kernel 在 2080 Ti 上不适合大块 prefill，但仍适合长上下文的
+单 token decode。设置 `EXL3_QSA_PREFILL_DENSE=1` 后，超过 BC decode graph 最大 q_len 的
+QSA prefill 会先完整更新 raw/pooled QSA cache planes，再经普通 dense dispatcher 优先进入
+FlashInfer FA2；随后的短 decode 仍使用 BC/Triton QSA sparse graph。4K prefill 还需设置
+`EXL3_FLASHINFER_WORKSPACE_MB=128`，默认 16 MiB 不足。
+
+这个策略会让超过 QSA 阈值的 prefill 从模型的 sparse attention 改为 dense attention，属于
+性能 profile，不可当作与原始 QSA 模型逐 token 一致的语义基线。`EXL3_QSA_DISABLE_SPARSE=1`
+仍只用于 A/B：它会关闭 sparse decode graph，不能替代上述分阶段策略。
+
+### 2026-09-05 功耗修复后的 TP2 重测
+
+4K prompt / 128 decode、同一随机输入的最终稳态样本如下。两个默认 QSA sparse 路径的
+token hash 都是当前基线
+`c6e8218f6c53cdecbdfaedc4a124ed50f36e5447e62241c6ba77452184667e44`：
+
+| 配置 | Prefill tok/s | Decode tok/s | token hash | 结论 |
+|---|---:|---:|---|---|
+| 默认 NCCL | 655.51 | 24.17 | `c6e821...` | 基线 |
+| `NCCL_ALGO=Ring NCCL_PROTO=Simple` | 662.65 | 24.62 | `c6e821...` | 当前合格最快路径 |
+| 上述 + `EXL3_QSA_PREFILL_DENSE=1` | 824.77 | 25.19 | `10e009...` | 输出已漂移，淘汰 |
+
+故 QSA dense-prefill 的吞吐增益不能计入可交付性能。它与原稀疏 QSA 路径在相同输入上产生
+不同 token 序列；在能逐 token 保持基线前，只能作为定位 FlashInfer/dense kernel 上限的 A/B。
+本轮功耗监控还确认两张 2080 Ti 可以分别升至约 1845/1875 MHz、约 228/253 W，当前 24--25
+tok/s decode 不是功耗限制。
+
+### 2026-09-06 功耗修复复验与专家路由结论
+
+在固定 GPU UUID、`NCCL_ALGO=Ring NCCL_PROTO=Simple`、`EXL3_NGRAM_STREAM=1` 和
+`EXL3_FLASHINFER_WORKSPACE_MB=128` 下，重新执行同一 4K/128 基准。按历史口径保留第二个
+fresh-state 请求（seed 3），结果为 **662.16 prefill tok/s / 25.11 decode tok/s**，token hash
+仍为 `c6e8218f6c53cdecbdfaedc4a124ed50f36e5447e62241c6ba77452184667e44`。相对功耗修复前的
+同口径 `662.65 / 24.62`，prefill 在波动范围内，decode 提升约 2.0%。推理期间两卡实测
+1815/1845 MHz、214/228 W，修复有效但无法消除 decode 的小 collective 开销。
+
+完整 128-token decode 的 MoE 路由 trace 显示 expert `0--255` / `256--511` 的总 assignment
+为 `33647 / 31633`（51.54% / 48.46%）；逐层平均绝对不平衡为 2.40，最大为 10。两 rank 的
+路由记录一致。因此不能通过任意静态 expert 重分片获得实质 TP2 加速，后续优先关注安全的
+collective 批量/图化与 QSA、GDN、MoE decode kernel。证据在
+`/home/max/results/tp2_powerfix_retest_20260906_01/` 和
+`/home/max/results/tp2_moe_route_balance_20260906_005/`。
 
 最可靠的定位结果是：漂移通常在早期 full-attention 路径暴露，重复 trace 中第一次明显差异出现在 layer 3；Q/K/V 投影基本稳定，`attn_o` 开始变化。跨 PP2/TP2 拓扑直接比较会在更早的 layer 0 出现数值差异，因此不能把跨拓扑差异直接当作 TP bug。
 
@@ -45,7 +139,8 @@
 |---|---|---|
 | 27B EXL3 单卡 2080 Ti | 8 次重复稳定 | `qwen38-27b-exl3-35bpw-sm75-20260904`；证明通用 GDN/量化路径可稳定 |
 | 27B EXL3 实际 PP2（layer split 8/22 GiB） | 8 次重复稳定 | `qwen38-27b-exl3-35bpw-sm75-tp2-quality-20260904`；证明通用 PP/P2P/layer split 不是 Flash-Next 特有质量根因 |
-| Flash-Next EXL3 TP2，4K/128，默认路径 | 加载/生成成功，但重复 hash 不稳定 | `qwen38-flash-next-exl3-205-sm75-tp2-*`；典型 prefill 约 548–563 tok/s，decode 约 19–25 tok/s |
+| Flash-Next EXL3 TP2，4K/128，默认 QSA sparse | 8/8 token hash 一致，真实检索正确 | `qwen38-tp2-current-20260905/default-deterministic-qsa-sparse-readable-eos-4k128-r8.log`；稳态约 486–498 tok/s prefill、20.9–24.1 tok/s decode |
+| Flash-Next EXL3 TP2，4K/128，QSA dense prefill | 8/8 token hash 一致，真实检索正确 | `qwen38-tp2-current-20260905/default-deterministic-readable-eos-4k128-r8.log`；稳态约 521–534 tok/s prefill、21.1–23.8 tok/s decode |
 | Flash-Next TP2，worker CUDA synchronize | 仍 `stable=false` | 只修复明显的 ack/lifetime 风险，不足以解决质量 |
 | Flash-Next TP2，`EXL3_TP_DEFER_FORWARD_ACKS=0` | 仍 `stable=false`，性能下降 | 典型 prefill 约 476–488 tok/s，decode 约 14–15 tok/s；deferred ack 不是唯一根因 |
 | Flash-Next TP2，`EXL3_DISABLE_PLE=1` | 仍 `stable=false` | PLE 不是唯一根因；不能据此删除 PLE 修复 |

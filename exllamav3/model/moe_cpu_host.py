@@ -1059,9 +1059,13 @@ class MoeCpuHost:
             fbufs = st["fused_bufs"].get(key)
             if fbufs is None:
                 conc = ext.exl3_moe_max_concurrency(torch.device(y.device).index or 0)
-                fbufs = tuple(
-                    torch.empty((conc, st["fused_t"], dim), dtype = torch.half, device = y.device)
-                    for dim in (key[0], key[0], key[1], key[1]))
+                fbufs = (
+                    torch.empty((conc, st["fused_t"], key[0]), dtype = torch.half, device = y.device),
+                    torch.empty((conc, st["fused_t"], key[0]), dtype = torch.half, device = y.device),
+                    torch.empty((conc, st["fused_t"], key[0]), dtype = torch.float, device = y.device),
+                    torch.empty((conc, st["fused_t"], key[1]), dtype = torch.half, device = y.device),
+                    torch.empty((conc, st["fused_t"], key[1]), dtype = torch.half, device = y.device),
+                )
                 st["fused_bufs"][key] = fbufs
 
         for i0 in range(0, len(streamed), per_slot):
@@ -1144,12 +1148,12 @@ class MoeCpuHost:
                 Kg = pd["g"][2] if gated else Ku
                 ext.exl3_moe(
                     y, out, ec, tok, wts,
-                    fbufs[0], fbufs[1], fbufs[2], fbufs[3],
+                    fbufs[0], fbufs[1], fbufs[2], fbufs[3], fbufs[4],
                     spec["activation"], Kg, Ku, Kd,
                     tblt[0], tblt[1], tblt[2], tblt[3], tblt[4], tblt[5],
                     tblt[6], tblt[7], tblt[8],
                     False, True, False, True, False, True,
-                    float(spec["act_limit"] or 0.0), n_fused)
+                    float(spec["act_limit"] or 0.0), n_fused, False)
 
             # Heavy tier: per-expert reconstruct
             for bi, e, idx, wseg in per_e:

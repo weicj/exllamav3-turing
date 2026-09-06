@@ -32,6 +32,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     // Buffers for group
     temp_state_g += group_idx * max_tokens_per_expert * hidden_dim;
     temp_state_u += group_idx * max_tokens_per_expert * hidden_dim;
+    temp_state_d += group_idx * max_tokens_per_expert * hidden_dim;
     temp_intermediate_g += group_idx * max_tokens_per_expert * intermediate_dim;
     temp_intermediate_u += group_idx * max_tokens_per_expert * intermediate_dim;
 
@@ -114,7 +115,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         had_gather_gu_in();
 
         // g, u GEMM
-        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
+        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis,
+                           const half* post_scale, const int K)
         {
             int size_m = token_count;
             while (size_m > 0)
@@ -127,7 +129,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     hidden_dim,         \
                     intermediate_dim,   \
                     locks,              \
-                    nullptr
+                    post_scale
                 #define SHAPE_ARGS      \
                     MOE_TILESIZE_M,     \
                     MOE_TILESIZE_K,     \
@@ -135,17 +137,17 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     MOE_SH_STAGES,      \
                     MOE_FRAG_STAGES
                 if constexpr (t_bits)
-                    exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
+                    exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, true>(ARGS);
                 else switch(K)
                 {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, true>(ARGS); break;
                 };
                 #undef ARGS
                 #undef SHAPE_ARGS
@@ -157,8 +159,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         };
 
         if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, exp_gate_svh, K_gate);
+        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, exp_up_svh, K_up);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
         // Output hadamard for g, u + activation+gate + input hadamard for d
@@ -179,7 +181,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     exp_down_suh + 128 * token_off,
                     0.088388347648f,
                     act_limit,
-                    act_function
+                    act_function,
+                    true
                 );
             }
             group_barrier(group_idx, group_size, barrier_counters_sense);
@@ -188,7 +191,8 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
         had_guad();
 
         // d GEMM
-        auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
+        auto gemm_down = [&](const half* in_addr, float* out_addr, const uint16_t* trellis,
+                             const half* post_scale, const int K)
         {
             int size_m = token_count;
             while (size_m > 0)
@@ -201,7 +205,7 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     intermediate_dim,   \
                     hidden_dim,         \
                     locks,              \
-                    nullptr
+                    post_scale
                 #define SHAPE_ARGS      \
                     MOE_TILESIZE_M,     \
                     MOE_TILESIZE_K,     \
@@ -209,17 +213,17 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                     MOE_SH_STAGES,      \
                     MOE_FRAG_STAGES
                 if constexpr (t_bits)
-                    exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
+                    exl3_gemm_kernel_inner<t_bits, true, cb, SHAPE_ARGS, true>(ARGS);
                 else switch(K)
                 {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
+                    case 1: exl3_gemm_kernel_inner<1, true, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 2: exl3_gemm_kernel_inner<2, true, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 3: exl3_gemm_kernel_inner<3, true, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 4: exl3_gemm_kernel_inner<4, true, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 5: exl3_gemm_kernel_inner<5, true, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 6: exl3_gemm_kernel_inner<6, true, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 7: exl3_gemm_kernel_inner<7, true, cb, SHAPE_ARGS, true>(ARGS); break;
+                    case 8: exl3_gemm_kernel_inner<8, true, cb, SHAPE_ARGS, true>(ARGS); break;
                 };
                 #undef ARGS
                 #undef SHAPE_ARGS
@@ -230,29 +234,38 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
             }
         };
 
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        gemm_down(temp_intermediate_g, temp_state_d, exp_down_trellis, exp_down_svh, K_down);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
         // Output hadamard for d + scatter add
         auto had_d_out = [&]()
         {
+            int t = threadIdx.x & 31;
             const int warps_per_token = hidden_dim / 128;
             const int total_warps = token_count * warps_per_token;
             const int64_t* top_x = token_sorted + start;
             const half* weights = weight_sorted + start;
             for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
             {
-                int token_idx = top_x[warp_idx / warps_per_token];
-                half weight = weights[warp_idx / warps_per_token];
+                int assignment_idx = warp_idx / warps_per_token;
+                int token_idx = top_x[assignment_idx];
+                float weight = __half2float(weights[warp_idx / warps_per_token]);
                 int token_off = warp_idx % warps_per_token;
-                float* out_ptr = output_state + token_idx * hidden_dim + token_off * 128;
-                had_hf_r_128_d_inner
-                (
-                    temp_state_g + 128 * warp_idx,
-                    out_ptr,
-                    exp_down_svh + 128 * token_off,
-                    0.088388347648f * __half2float(weight)
-                );
+                // The normal route sums overlapping expert contributions with atomics.
+                // The deterministic route gives every sorted assignment its own row; Python
+                // unsorts and reduces those unique rows after the fused kernel returns.
+                int output_idx = direct_output ? start + assignment_idx : token_idx;
+                float* out_ptr = output_state + output_idx * hidden_dim + token_off * 128;
+                const float* in_ptr = temp_state_d + 128 * warp_idx;
+                #pragma unroll
+                for (int j = 0; j < 4; ++j)
+                {
+                    float value = in_ptr[j * 32 + t] * weight;
+                    if (direct_output)
+                        out_ptr[j * 32 + t] = value;
+                    else
+                        atomicAdd(out_ptr + j * 32 + t, value);
+                }
             }
         };
 

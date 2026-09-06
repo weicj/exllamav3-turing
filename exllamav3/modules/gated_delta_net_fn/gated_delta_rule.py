@@ -18,6 +18,11 @@ try:
 except (ModuleNotFoundError, ImportError):
     chunk_kda = None
 
+# Keep the KDA prefill implementation independently selectable. Flash-Next uses
+# channelwise KDA, so EXL3_DISABLE_FLA_GDN does not affect this branch.
+if os.environ.get("EXL3_DISABLE_FLA_KDA", "0") == "1":
+    chunk_kda = None
+
 # """
 # fla wrapper, reduce overhead by bypassing input_guard and torch custom ops stuff
 # """

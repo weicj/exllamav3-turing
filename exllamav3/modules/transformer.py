@@ -20,11 +20,28 @@ _subtrace_layers = {
 _subtrace_stages = {
     value for value in os.environ.get("EXL3_SUBTRACE_STAGES", "").split(",") if value
 }
+_subtrace_signature = os.environ.get("EXL3_SUBTRACE_SIGNATURE", "0") == "1"
+_subtrace_call_filter = {
+    int(value) for value in os.environ.get("EXL3_SUBTRACE_CALLS", "").split(",") if value
+}
 _subtrace_calls = {}
 _subtrace_current_calls = {}
 
 
 def _subtrace_sha256(tensor: torch.Tensor) -> str:
+    # A full cryptographic digest requires copying every traced tensor to the host. For
+    # a broad layer scan, use exact integer summaries of the raw bytes on the GPU instead.
+    # Four residue classes plus byte squares make an accidental collision implausible for
+    # numerical-drift localization, while keeping PCIe traffic to a few scalar values.
+    if _subtrace_signature:
+        bits = tensor.detach().contiguous().view(torch.uint8)
+        sums = []
+        squares = []
+        for offset in range(4):
+            values = bits[offset::4].to(torch.int64)
+            sums.append(int(values.sum().item()))
+            squares.append(int(values.square().sum().item()))
+        return "sig:" + ",".join(str(value) for value in (*sums, *squares))
     bits = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
     return hashlib.sha256(bits).hexdigest()
 
@@ -35,15 +52,20 @@ def _save_subtrace(module, stage: str, tensor: torch.Tensor):
         module.layer_idx not in _subtrace_layers if _subtrace_layers else module.layer_idx != _subtrace_layer
     ):
         return
+    # Mark the invocation before any sublayer mixer consumes the residual stack.
+    # Updating before stage selection lets a trace select a prefill/decode call even
+    # when it records only later boundaries.
+    if stage == "block_input":
+        call = _subtrace_calls.get(module.key, 0)
+        _subtrace_calls[module.key] = call + 1
+        _subtrace_current_calls[module.key] = call
+    else:
+        call = _subtrace_current_calls.get(module.key, -1)
+    if _subtrace_call_filter and call not in _subtrace_call_filter:
+        return
     if _subtrace_stages and stage not in _subtrace_stages:
         return
     if _subtrace_path is not None:
-        if stage == "attn_input":
-            call = _subtrace_calls.get(module.key, 0)
-            _subtrace_calls[module.key] = call + 1
-            _subtrace_current_calls[module.key] = call
-        else:
-            call = _subtrace_current_calls.get(module.key, -1)
         row = {
             "call": call,
             "key": module.key,
@@ -63,10 +85,14 @@ def _save_subtrace(module, stage: str, tensor: torch.Tensor):
         device = str(tensor.device).replace(":", "_")
         torch.save({
             "key": module.key,
+            "call": call,
             "stage": stage,
             "shape": tuple(tensor.shape),
             "tensor": tensor.detach().float().cpu().contiguous(),
-        }, os.path.join(_subtrace_dir, f"{mode}-{device}-l{module.layer_idx:03d}-{stage}.pt"))
+        }, os.path.join(
+            _subtrace_dir,
+            f"{mode}-{device}-l{module.layer_idx:03d}-c{call:03d}-{stage}.pt",
+        ))
 
 class TransformerBlock(Module):
 
@@ -202,14 +228,37 @@ class TransformerBlock(Module):
         out_dtype: torch.dtype | None = None
     ) -> torch.Tensor:
 
+        # An opt-in TP worker profile supplies an event list for one requested forward pass.
+        # Keep the instrumentation here, at the architectural boundaries, rather than inside
+        # individual kernels: this gives a reliable GDN/attention vs. MoE vs. hyperconnection
+        # breakdown while retaining the normal asynchronous execution schedule.
+        profile_events = params.get("_tp_submodule_profile")
+
+        def profile_start():
+            if profile_events is None:
+                return None
+            event = torch.cuda.Event(enable_timing = True)
+            event.record()
+            return event
+
+        def profile_end(stage: str, start):
+            if start is None:
+                return
+            end = torch.cuda.Event(enable_timing = True)
+            end.record()
+            profile_events.append((self.key, stage, start, end))
+
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
 
         if self.attn:
+            _save_subtrace(self, "block_input", x)
+            event = profile_start()
             if self.attn_hc:
                 hc_post, hc_comb, y = self.attn_hc.mix(x, params)
+                _save_subtrace(self, "attn_hc_mixed", y)
                 y = y.half()
                 if self.attn_norm:
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
@@ -217,13 +266,17 @@ class TransformerBlock(Module):
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
+            profile_end("attn_input", event)
             _save_subtrace(self, "attn_input", y)
+            event = profile_start()
             y = self.attn.forward(y, params)
+            profile_end("attn", event)
             _save_subtrace(self, "attn_output", y)
             if params.get("prefill") and not export_state:
                 return x
             if self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
+            event = profile_start()
             if self.attn_hc:
                 x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.attn_post_norm:
@@ -232,11 +285,14 @@ class TransformerBlock(Module):
                 y_resid = y
             else:
                 x += y
+            profile_end("attn_residual", event)
             _save_subtrace(self, "post_attn", x)
 
         if self.mlp:
+            event = profile_start()
             if self.mlp_hc:
                 hc_post, hc_comb, y = self.mlp_hc.mix(x, params)
+                _save_subtrace(self, "mlp_hc_mixed", y)
                 y = y.half()
                 if self.mlp_norm:
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
@@ -248,17 +304,22 @@ class TransformerBlock(Module):
                     y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
                 else:
                     y = x.half()
+            profile_end("mlp_input", event)
             _save_subtrace(self, "mlp_input", y)
+            event = profile_start()
             y = self.mlp.forward(y, params)
+            profile_end("mlp", event)
             _save_subtrace(self, "mlp_output", y)
             if self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
+            event = profile_start()
             if self.mlp_hc:
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
             else:
                 x += y
+            profile_end("mlp_residual", event)
             _save_subtrace(self, "post_mlp", x)
 
         if export_state:

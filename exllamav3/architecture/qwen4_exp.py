@@ -204,6 +204,9 @@ def build_qwen4_block(
             qbits_key = qbits_key,
             interm_dtype = torch.half,
             out_dtype = torch.float,
+            # Flash-Next TP2 is sensitive to unordered fused MoE accumulation. This
+            # reaches the config-less TP workers through BlockSparseMLP.tp_export().
+            tp_deterministic_reduce = True,
             shared_experts = GatedMLP(
                 config = config,
                 key = f"{key}.mlp.shared_expert",
@@ -305,7 +308,7 @@ class Qwen4ExpModel(Model):
 
         self.calibration_all_experts = True
         self.caps.update({
-            "supports_tp": False,
+            "supports_tp": True,
             "recurrent_states": True,
             "default_recurrent_checkpoint_interval": 2048,
             "linear_attn": True,

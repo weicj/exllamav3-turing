@@ -213,6 +213,36 @@ def test_cuda_recurrent_gated_delta_rule_matches_torch(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
+@torch.inference_mode()
+def test_cuda_gated_delta_rule_is_bitwise_repeatable_for_flash_next_geometry():
+    """Exercise the SM75 v-split kernel used by Qwen3.8 Flash-Next prefill."""
+    torch.manual_seed(20260904)
+    target_device = torch.device("cuda:0")
+    num_k_heads, num_v_heads, head_dim, seqlen = 16, 48, 128, 512
+    qkv_dim = (2 * num_k_heads + num_v_heads) * head_dim
+    mixed_qkv = torch.randn((1, seqlen, qkv_dim), device = target_device, dtype = torch.float).bfloat16()
+    g = -torch.rand((1, seqlen, num_v_heads), device = target_device, dtype = torch.float)
+    beta = torch.rand((1, seqlen, num_v_heads), device = target_device, dtype = torch.float).bfloat16()
+    slots = torch.zeros((1,), dtype = torch.int32, device = target_device)
+
+    observed = []
+    for _ in range(8):
+        state = torch.zeros((1, 1, num_v_heads, head_dim, head_dim), dtype = torch.float, device = target_device)
+        output = torch.empty((1, seqlen, num_v_heads, head_dim), dtype = torch.bfloat16, device = target_device)
+        from exllamav3.ext import exllamav3_ext as ext
+        ext.cuda_recurrent_gated_delta_rule(
+            mixed_qkv, g, beta, state, output,
+            num_k_heads, num_v_heads, head_dim, head_dim, slots, False,
+        )
+        torch.cuda.synchronize(target_device)
+        observed.append((output.cpu(), state.cpu()))
+
+    for output, state in observed[1:]:
+        torch.testing.assert_close(output, observed[0][0], rtol = 0, atol = 0)
+        torch.testing.assert_close(state, observed[0][1], rtol = 0, atol = 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "CUDA required")
 @pytest.mark.parametrize(
     "bsz,seqlen,num_k_heads,num_v_heads,k_head_dim,v_head_dim",
     [

@@ -1,5 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
+import hashlib
+import json
 import math
 import os
 import torch
@@ -8,6 +10,42 @@ from .module import Module
 from .linear import Linear
 from .rmsnorm import RMSNorm
 from ..model.config import Config
+
+
+_qsa_subtrace_path = os.environ.get("EXL3_QSA_SUBTRACE_JSONL")
+_qsa_subtrace_key = os.environ.get("EXL3_QSA_SUBTRACE_KEY")
+_qsa_subtrace_calls = {}
+_qsa_subtrace_current_calls = {}
+
+
+def _save_qsa_subtrace(module, stage: str, tensor: torch.Tensor):
+    """Hash QSA boundaries while diagnosing TP repeatability.
+
+    The helper is deliberately environment-gated because moving a tensor to the host
+    synchronizes its device. ``qk`` starts a new indexer invocation; later stages
+    are associated with that invocation.
+    """
+    if _qsa_subtrace_path is None or (
+        _qsa_subtrace_key not in (None, "*") and module.key != _qsa_subtrace_key
+    ):
+        return
+    if stage == "qk":
+        call = _qsa_subtrace_calls.get(module.key, 0)
+        _qsa_subtrace_calls[module.key] = call + 1
+        _qsa_subtrace_current_calls[module.key] = call
+    else:
+        call = _qsa_subtrace_current_calls.get(module.key, -1)
+    bits = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    row = {
+        "call": call,
+        "key": module.key,
+        "stage": stage,
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "sha256": hashlib.sha256(bits).hexdigest(),
+    }
+    with open(f"{_qsa_subtrace_path}.d{tensor.device.index}", "a") as handle:
+        handle.write(json.dumps(row, sort_keys = True) + "\n")
 
 """
 QSA (Qwen sparse attention) indexer: selects which tokens each query may attend to, at 4-token
@@ -462,6 +500,7 @@ class QSAIndexer(Module):
         page_size = layer.raw_k.shape[1]
 
         qk = self.index_qk_proj.forward(x.contiguous(), params).view(R, (H + 1) * dk)
+        _save_qsa_subtrace(self, "qk", qk)
         q = g_tensor_cache.get_bucketed(dev, R * H * dk, torch.half, "qsa_up_q") \
             .view(bsz, seqlen, H, dk)
         kraw = g_tensor_cache.get_bucketed(dev, R * dk, torch.half, "qsa_up_k") \
@@ -485,6 +524,9 @@ class QSAIndexer(Module):
                 attn_factor = float(rope.attn_factor),
                 eps = float(self.k_layernorm.rms_norm_eps), MAXPOOLS = 1,
             )
+        _save_qsa_subtrace(self, "q", q)
+        _save_qsa_subtrace(self, "raw_k", kraw)
+        _save_qsa_subtrace(self, "pooled", layer.pooled)
         return q
 
     def update_planes_ref(
@@ -567,6 +609,7 @@ class QSAIndexer(Module):
                 q_idx[b].contiguous(), pool_flat, pos0, (pos0 + seq) // cr,
                 out[b * seq : (b + 1) * seq], block_table = bt[b], epp = epp,
             )
+        _save_qsa_subtrace(self, "indices", out)
         return out
 
     def select_indices_paged_ref(
@@ -647,4 +690,5 @@ class QSAIndexer(Module):
             indices, attn.sm_scale,
             block_table = bt_rows, page_size = layer.k.shape[1],
         )
+        _save_qsa_subtrace(self, "attn_o", o)
         return o.view(bsz, seq, attn.num_q_heads, attn.head_dim)

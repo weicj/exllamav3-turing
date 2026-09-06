@@ -2,7 +2,9 @@
 
 The standard FlashInfer paged prefill wrapper directly accepts ExLlama's fp16
 ``(pages, 256, kv_heads, head_dim)`` cache layout. QSA sparse attention bypasses the
-normal dispatcher before reaching this module, and decode remains on BC/Triton.
+normal dispatcher before reaching this module, and decode remains on BC/Triton. Set
+``EXL3_QSA_PREFILL_DENSE=1`` to use this dense path for long QSA prefill while preserving
+the QSA cache planes and sparse decode graph.
 """
 
 import os

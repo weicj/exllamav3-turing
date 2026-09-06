@@ -310,6 +310,13 @@ __device__ __forceinline__ void gemv_int8_row_sums
 #define GEMV_STAGE_D 4      // cp.async pipeline depth (rows) for the smem-staged unit
 #define GEMV_STAGE_MAX_BYTES (8 * GEMV_STAGE_D * 16 * 8 * 4)   // 8 warps, K = 8
 
+// Turing exposes 64 KiB of dynamic shared memory per block.  The original implementation
+// reserved an 80 KiB budget for the sq path and consequently disabled int8 GEMV on SM75 even
+// though the actual K=2/3/4 layouts fit.  Keep a single conservative limit here and subtract
+// the per-kernel staging/epilogue area when deriving rows_per; both host dispatch and device
+// kernels call the same helper below.
+#define GEMV_INT8_SMEM_LIMIT (64 * 1024)
+
 // Per-slice-scale ("sq") kernel parameters
 #define SQ_KSPLIT_CAP 64
 #define SQ_MINROWS 16       // minimum slice height (staging overhead amortization)
@@ -707,6 +714,24 @@ __host__ __device__ constexpr bool gemv_int8_stage_smem(int bits)
     return bits == 3 || bits == 5 || bits == 7;
 }
 
+__host__ __device__ constexpr int gemv_int8_stage_bytes(int bits)
+{
+    return gemv_int8_stage_smem(bits) ? 8 * GEMV_STAGE_D * 16 * bits * 4 : 0;
+}
+
+// Maximum sq slice height for the selected bit width and activation mode.  The old helper used
+// a fixed 80 KiB numerator and did not account for the staged-B/epilogue bytes, which could both
+// reject valid SM75 launches and over-request shared memory for residual mode.
+__host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual, int bits)
+{
+    constexpr int epilogue_bytes_per_row = 2 * 128 * 4;
+    int per_row = 32 + 64 * M * (residual ? 2 : 1);
+    int fixed = gemv_int8_stage_bytes(bits) + M * epilogue_bytes_per_row;
+    int cap = (GEMV_INT8_SMEM_LIMIT - fixed) / per_row;
+    cap &= ~7;
+    return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
+}
+
 // Epilogue for one row: affine correction + output Hadamard + svh scale + accumulator reset,
 // striped over all warps of the grid. sh_tmp: 128 floats per warp.
 template <bool c_fp32, bool residual>
@@ -946,15 +971,6 @@ __device__ __forceinline__ void gemv_int8_epilogue_group_sq
         had_fh_r_128_inner<false, true>(tmp, ((half*) C) + (size_t) row * size_n + base, svh + base, 0.088388347648f);
 }
 
-// Shared-memory cap for the sq decomposition: row halfs (32 B/row) + M splat regions (64 B/row each,
-// x2 residual), within ~80 KB so the stage region and epilogue staging still fit under the opt-in max
-__host__ __device__ constexpr int gemv_int8_sq_rows_max(int M, bool residual)
-{
-    int cap = (80 * 1024) / (32 + 64 * M * (residual ? 2 : 1));
-    cap &= ~7;
-    return cap < SQ_ROWS_MAX ? cap : SQ_ROWS_MAX;
-}
-
 template <int bits, int M, bool c_fp32, bool residual>
 __global__ __launch_bounds__(NUM_THREADS)
 void exl3_gemv_int8_sq_kernel
@@ -983,7 +999,7 @@ void exl3_gemv_int8_sq_kernel
     int r = CEIL_DIVIDE(rows_total * nb256_total, (int) gridDim.x);
     int rows_per = (MAX(r, MIN(2 * r, 32)) + 7) & ~7;
     rows_per = MAX(rows_per, SQ_MINROWS);
-    rows_per = MIN(rows_per, gemv_int8_sq_rows_max(M, residual));
+    rows_per = MIN(rows_per, gemv_int8_sq_rows_max(M, residual, bits));
     rows_per = MIN(rows_per, (rows_total + 7) & ~7);
     int ksplit = CEIL_DIVIDE(rows_total, rows_per);
     int units = nb256_total * ksplit;

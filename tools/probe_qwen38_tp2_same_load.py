@@ -24,6 +24,23 @@ REPEATS = int(os.environ.get("PROBE_REPEATS", "8"))
 CACHE_TOKENS = int(os.environ.get("BENCH_CACHE_TOKENS", "4352"))
 USE_PER_DEVICE = [float(value) for value in os.environ.get("BENCH_USE_PER_DEVICE", "22,22").split(",")]
 TP_BACKEND = os.environ.get("BENCH_TP_BACKEND", "nccl")
+LOAD_CHUNK_TOKENS = int(os.environ.get("BENCH_LOAD_CHUNK_TOKENS", "256"))
+PREFILL_CHUNK_TOKENS = int(os.environ.get("BENCH_CHUNK_TOKENS", "512"))
+
+
+def runtime_toggles():
+    names = (
+        "EXL3_BC_ATTN",
+        "EXL3_FLASHINFER",
+        "EXL3_FLASHINFER_WORKSPACE_MB",
+        "EXL3_GEMV",
+        "EXL3_INT8_GEMV",
+        "EXL3_MGEMM_K_THRESHOLD",
+        "EXL3_MGEMM_N_THRESHOLD",
+        "EXL3_QSA_DISABLE_SPARSE",
+        "EXL3_QSA_PREFILL_DENSE",
+    )
+    return {name: os.environ.get(name, "<default>") for name in names}
 
 
 def run_job(generator, prompt_tokens, output_tokens, seed):
@@ -84,7 +101,7 @@ def main():
             tensor_p=True,
             tp_backend=TP_BACKEND,
             use_per_device=USE_PER_DEVICE,
-            max_chunk_size=256,
+            max_chunk_size=LOAD_CHUNK_TOKENS,
             max_batch_size=1,
             verbose=True,
         )
@@ -93,7 +110,7 @@ def main():
             cache=cache,
             tokenizer=Tokenizer.from_config(config),
             max_batch_size=1,
-            max_chunk_size=512,
+            max_chunk_size=PREFILL_CHUNK_TOKENS,
         )
         warmup = run_job(generator, 128, 8, 1)
         clear_request_cache(generator)
@@ -106,6 +123,10 @@ def main():
             "tp_backend": TP_BACKEND,
             "prompt_tokens": PROMPT_TOKENS,
             "output_tokens": OUTPUT_TOKENS,
+            "cache_tokens": CACHE_TOKENS,
+            "loader_chunk_tokens": LOAD_CHUNK_TOKENS,
+            "prefill_chunk_tokens": PREFILL_CHUNK_TOKENS,
+            "runtime_toggles": runtime_toggles(),
             "repeat_count": REPEATS,
             "tp_plan": model.plan,
             "warmup": warmup,

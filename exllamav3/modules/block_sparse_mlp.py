@@ -1,5 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
+import hashlib
+import json
 import os
 import torch
 import torch.nn.functional as F
@@ -24,6 +26,85 @@ MAX_BSZN = 8  # must match MAX_BSZN in exllamav3_ext/libtorch/blocksparse_mlp.h
 # Score activations for the nogroup routing kernels (must match routing.cu)
 ROUTING_ACT_SIGMOID = 0
 ROUTING_ACT_SQRTSP = 1
+
+
+def _moe_deterministic_reduce_settings(
+    tp_reduce: bool,
+    tp_deterministic_reduce: bool,
+) -> tuple[bool, str]:
+    """Resolve the TP MoE reduction policy, retaining environment overrides."""
+    explicit_reduce = os.environ.get("EXL3_MOE_DETERMINISTIC_REDUCE")
+    if explicit_reduce is None:
+        enabled = tp_reduce and tp_deterministic_reduce
+        # The vectorized expert-id ordering is deterministic without the per-expert
+        # host readback used by the literal fallback replay. It passed Flash-Next's
+        # long-context quality gate and is the usable TP default.
+        default_mode = "expert_sum"
+    else:
+        enabled = explicit_reduce == "1"
+        # Preserve the historical environment opt-in behavior. The architecture default
+        # below uses the validated fallback-equivalent order instead.
+        default_mode = "expert_sum"
+    return enabled, os.environ.get("EXL3_MOE_DETERMINISTIC_REDUCE_MODE", default_mode)
+
+
+_moe_subtrace_path = os.environ.get("EXL3_MOE_SUBTRACE_JSONL")
+_moe_subtrace_key = os.environ.get("EXL3_MOE_SUBTRACE_KEY")
+_moe_subtrace_stages = {
+    value for value in os.environ.get("EXL3_MOE_SUBTRACE_STAGES", "").split(",") if value
+}
+_moe_subtrace_call_filter = {
+    int(value) for value in os.environ.get("EXL3_MOE_SUBTRACE_CALLS", "").split(",") if value
+}
+_moe_subtrace_expert_outputs = os.environ.get("EXL3_MOE_SUBTRACE_EXPERT_OUTPUTS", "0") == "1"
+_moe_subtrace_tensors = os.environ.get("EXL3_MOE_SUBTRACE_TENSORS", "0") == "1"
+# Routing IDs are tiny but obtaining them from a CUDA worker synchronizes that worker.
+# Keep value capture separate from tensor dumps so performance probes only pay this cost
+# when they are explicitly measuring expert-shard balance.
+_moe_subtrace_routing_values = os.environ.get("EXL3_MOE_SUBTRACE_ROUTING_VALUES", "0") == "1"
+_moe_subtrace_calls = {}
+_moe_subtrace_current_calls = {}
+
+
+def _save_moe_subtrace(module, stage: str, tensor: torch.Tensor, expert: int | None = None):
+    """Record exact BlockSparseMLP boundaries for TP determinism localization."""
+    if _moe_subtrace_path is None or (
+        _moe_subtrace_key not in (None, "*") and module.key != _moe_subtrace_key
+    ):
+        return
+    if stage == "input":
+        call = _moe_subtrace_calls.get(module.key, 0)
+        _moe_subtrace_calls[module.key] = call + 1
+        _moe_subtrace_current_calls[module.key] = call
+    else:
+        call = _moe_subtrace_current_calls.get(module.key, -1)
+    if _moe_subtrace_call_filter and call not in _moe_subtrace_call_filter:
+        return
+    if _moe_subtrace_stages and stage not in _moe_subtrace_stages:
+        return
+    bits = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    row = {
+        "call": call,
+        "key": module.key,
+        "stage": stage,
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "sha256": hashlib.sha256(bits).hexdigest(),
+    }
+    if expert is not None:
+        row["expert"] = expert
+    if _moe_subtrace_routing_values and stage == "selected_experts":
+        row["values"] = tensor.detach().reshape(-1).cpu().tolist()
+    # TP workers share the environment. Separate logs prevent concurrent append interleaving.
+    with open(f"{_moe_subtrace_path}.d{tensor.device.index}", "a") as handle:
+        handle.write(json.dumps(row, sort_keys = True) + "\n")
+    if _moe_subtrace_tensors:
+        # Persist the selected diagnostic boundary, retaining values for a fused/fallback
+        # comparison. The key/call/stage filters above keep this opt-in dump bounded.
+        torch.save(
+            {"tensor": tensor.detach().cpu(), **row},
+            f"{_moe_subtrace_path}.d{tensor.device.index}.c{call}.{stage}.pt",
+        )
 
 def _esb_h(cfg):
     """fp16 selection-bias copy for the CUDA top-k kernels, built lazily (load may be
@@ -58,6 +139,7 @@ class RoutingCFG:
 class FusedBuffers:
     temp_state_g: torch.Tensor
     temp_state_u: torch.Tensor
+    temp_state_d: torch.Tensor
     temp_intermediate_g: torch.Tensor
     temp_intermediate_u: torch.Tensor
 
@@ -370,6 +452,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         frange_dim: int = 0,
         gate_up_interleaved: bool = False,
         alt_residual_channel: bool = False,
+        tp_deterministic_reduce: bool = False,
         qbits_key: str = "bits"
     ):
         super().__init__(config, key, None)
@@ -393,6 +476,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         self.router_type = router_type
         self.act_limit = act_limit
         self.alt_residual_channel = alt_residual_channel
+        # TP workers are constructed with config=None, so this policy must be carried
+        # through tp_export rather than inferred from the architecture there.
+        self.tp_deterministic_reduce = tp_deterministic_reduce
 
         self.routing_first = routing_first
         self.routing_last = routing_last
@@ -874,12 +960,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             )
 
             # The fused kernel scatters a token's expert contributions with float atomics.
-            # Keep a switch for numerical diagnosis against the serial expert path.
-            if self.support_fused and os.environ.get("EXL3_MOE_DISABLE_FUSED", "0") != "1":
+            # The deterministic diagnostic path instead materializes one unique slot per
+            # (token, top-k position) and reduces those slots in a fixed order in forward().
+            # It is intentionally opt-in until its quality and throughput are established.
+            if (
+                self.support_fused and
+                os.environ.get("EXL3_MOE_DISABLE_FUSED", "0") != "1"
+            ):
                 C = ext.exl3_moe_max_concurrency(torch.device(device).index)
                 self.fused_mode_buffers = FusedBuffers(
                     temp_state_g = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, H), torch.half, "moe2_temp_state_g"),
                     temp_state_u = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, H), torch.half, "moe2_temp_state_u"),
+                    temp_state_d = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, H), torch.float, "moe2_temp_state_d"),
                     temp_intermediate_g = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, I), torch.half, "moe2_temp_intermediate_g"),
                     temp_intermediate_u = g_tensor_cache.get(device, (C, TEMP_ROWS_FUSED, I), torch.half, "moe2_temp_intermediate_u"),
                 )
@@ -999,6 +1091,16 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             y = x.view(-1, self.hidden_size)
         bsz = y.shape[0]
         bc_sh_exp = False
+        _save_moe_subtrace(self, "input", y)
+
+        # The fused kernel can materialize one output row per routed assignment and leave the
+        # fixed-order reduction to Python.  Keep this decode experiment opt-in: BC's captured
+        # grouped-MGEMM path remains the production default until its quality and throughput
+        # comparison has been measured on the target topology.
+        force_fused_decode = (
+            os.environ.get("EXL3_MOE_FORCE_FUSED_DECODE", "0") != "0" and
+            bsz == 1 and self.fused_mode_buffers is not None
+        )
 
         # Eligibility for the multi-row CUDA-graph path (bsz 1..MAX_BSZN): computed up front so
         # it can override the f_threshold-based routing below (bsz>=f_threshold would otherwise
@@ -1037,6 +1139,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         if self.routing_device is not None:
             params["backend"].broadcast(selected_experts, src_device = self.routing_device)
             params["backend"].broadcast(routing_weights, src_device = self.routing_device)
+        _save_moe_subtrace(self, "selected_experts", selected_experts)
+        _save_moe_subtrace(self, "routing_weights", routing_weights)
 
         # CPU expert offload (block_sparse_mlp_cpu.py): split layers hand the tail experts'
         # share to the worker now so it computes concurrently with the GPU expert paths below
@@ -1055,7 +1159,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Torch/C++/fused path
         elif (
-            (bsz >= self.f_threshold and not bszn_eligible) or not self.is_quantized or
+            (bsz >= self.f_threshold and not bszn_eligible) or force_fused_decode or not self.is_quantized or
             self.config.infer_params.no_reconstruct or
             not (self.support_quant_paths or bszn_eligible)
         ):
@@ -1069,6 +1173,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
             #     shifted = torch.where(invalid, torch.zeros_like(selected_experts), selected_experts + 1)
             #     expert_mask = F.one_hot(shifted, num_classes = self.num_local_experts + 1)[..., 1:]
 
+            deterministic_reduce, deterministic_reduce_mode = _moe_deterministic_reduce_settings(
+                self.tp_reduce,
+                self.tp_deterministic_reduce,
+            )
+            assignment_states = None
+            assignment_states_sorted = None
             if self.num_local_experts is None or self.num_local_experts > 0:
 
                 num_ex = self.num_local_experts or self.num_experts
@@ -1080,7 +1190,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 flat_expert_global = selected_experts.reshape(-1)               # [num_tokens * top_k]
                 flat_weight = routing_weights.reshape(-1)                       # [num_tokens * top_k]
 
-                # Token indices corresponding to each flattened assignment
+                # Token indices corresponding to each flattened assignment. ``order`` is
+                # also the unique original (token * top_k + top-k slot) destination for a
+                # deterministic contribution buffer below.
                 flat_token = buffered_interleaved_arange(num_tokens, top_k, device = y.device)
 
                 # Map to local expert ids whenever this module holds a slice (TP shard or
@@ -1100,18 +1212,35 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # Count how many assignments per expert
                 expert_count = torch.bincount(flat_expert_local, minlength = E + 1)
 
+                if deterministic_reduce:
+                    assignment_states = g_tensor_cache.get_bucketed(
+                        self.device,
+                        num_tokens * top_k * self.hidden_size,
+                        torch.float,
+                        "moe_deterministic_assignment_states",
+                    ).view(num_tokens * top_k, self.hidden_size)
+                    assignment_states.zero_()
+                    assignment_states_sorted = g_tensor_cache.get_bucketed(
+                        self.device,
+                        num_tokens * top_k * self.hidden_size,
+                        torch.float,
+                        "moe_deterministic_assignment_states_sorted",
+                    ).view(num_tokens * top_k, self.hidden_size)
+                    assignment_states_sorted.zero_()
+
                 def run_fused(num_active):
                     # Gateless: the up module stands in for the gate pointer tables (the kernel
                     # skips the gate GEMM when activation_fn_idx is MOE_ACT_RELU2_NOGATE)
                     multi_gate = self.multi_gate if self.gated else self.multi_up
                     ext.exl3_moe(
                         y,
-                        final_hidden_states,
+                        assignment_states_sorted if deterministic_reduce else final_hidden_states,
                         expert_count,
                         token_sorted,
                         weight_sorted,
                         self.fused_mode_buffers.temp_state_g,
                         self.fused_mode_buffers.temp_state_u,
+                        self.fused_mode_buffers.temp_state_d,
                         self.fused_mode_buffers.temp_intermediate_g,
                         self.fused_mode_buffers.temp_intermediate_u,
                         self.activation_fn_idx,
@@ -1134,7 +1263,8 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         self.multi_down.mcg,
                         self.multi_down.mul1,
                         self.act_limit,
-                        num_active
+                        num_active,
+                        deterministic_reduce,
                     )
 
                 # With few enough total assignments, no expert can exceed the fused kernel's
@@ -1143,8 +1273,18 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 # unnecessary, and the overflow fallback loop below cannot have work.
                 # num_active -1 = unknown, kernel launches at max concurrency
                 if self.fused_mode_buffers is not None and num_tokens * top_k <= TEMP_ROWS_FUSED:
-                    run_fused(-1)
-                    expert_count_list = None
+                    # At decode the exact number of local experts would require a host sync.
+                    # The routed-slot count is a safe upper bound and lets the fused scheduler
+                    # widen its groups instead of reserving the conservative max-concurrency
+                    # geometry intended for large prefills.
+                    run_fused(num_tokens * top_k if force_fused_decode else -1)
+                    # No overflow loop is needed in this branch, but keep the loop
+                    # bookkeeping initialized for deterministic diagnostic reductions.
+                    min_rows = TEMP_ROWS_FUSED
+                    # The normal fused path avoids a host readback. Diagnostic reduction
+                    # modes need expert boundaries to reproduce the serial fallback order.
+                    expert_count_list = expert_count.tolist() if deterministic_reduce and \
+                        deterministic_reduce_mode == "expert_index_add" else None
                 else:
                     expert_count_list = expert_count.tolist()
 
@@ -1156,6 +1296,12 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                         min_rows = TEMP_ROWS_FUSED
                     else:
                         min_rows = 0
+
+                # Materialize the fused contribution slots before the serial overflow path.
+                # The latter then fills its own (currently zero) slots without being clobbered
+                # by skipped fused experts during the final reduction.
+                if assignment_states is not None and assignment_states_sorted is not None:
+                    assignment_states.index_copy_(0, order, assignment_states_sorted)
 
                 out_state = None
                 interm = None
@@ -1222,10 +1368,54 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
                         current_state = mlp(expert_idx, current_state)
 
+                    if _moe_subtrace_expert_outputs:
+                        _save_moe_subtrace(self, "expert_output", current_state, expert_idx)
                     current_state.mul_(w)
-                    final_hidden_states.index_add_(0, top_x, current_state)
+                    if deterministic_reduce:
+                        # ``order`` is a permutation of flattened top-k slots, so index_copy_
+                        # has no write conflicts. The subsequent dim-1 sum is a fixed-order
+                        # local reduction, unlike index_add_ / the fused atomic scatter.
+                        assignment_states.index_copy_(0, order[start:end], current_state)
+                    else:
+                        final_hidden_states.index_add_(0, top_x, current_state)
                     start = end
 
+            if assignment_states is not None:
+                _save_moe_subtrace(self, "assignment_states", assignment_states)
+                if deterministic_reduce_mode == "expert_index_add":
+                    # Match the trusted fallback literally: visit experts in increasing ID
+                    # order and index_add each expert's weighted contribution into token rows.
+                    # This is diagnostic and slower than the vectorized fixed-order sum.
+                    final_hidden_states = torch.zeros_like(y, dtype = torch.float)
+                    start = 0
+                    for expert_idx in range(num_ex):
+                        count = expert_count_list[expert_idx]
+                        end = start + count
+                        if count:
+                            final_hidden_states.index_add_(
+                                0,
+                                flat_token[order[start:end]],
+                                assignment_states[order[start:end]],
+                            )
+                        start = end
+                elif assignment_states_sorted is not None:
+                    # The serial fallback visits experts in increasing expert-id order. Match
+                    # that order per token before reducing, rather than adding in router top-k
+                    # order: Flash-Next recurrent states are sensitive to the last-bit change.
+                    expert_order = selected_experts.argsort(dim = 1, stable = True).unsqueeze(-1).expand(
+                        -1, -1, self.hidden_size
+                    )
+                    torch.gather(
+                        assignment_states.view(num_tokens, top_k, self.hidden_size),
+                        1,
+                        expert_order,
+                        out = assignment_states_sorted.view(num_tokens, top_k, self.hidden_size),
+                    )
+                    final_hidden_states = assignment_states_sorted.view(
+                        num_tokens, top_k, self.hidden_size
+                    ).sum(dim = 1)
+                else:
+                    final_hidden_states = assignment_states.view(num_tokens, top_k, self.hidden_size).sum(dim = 1)
             final_hidden_states = final_hidden_states.reshape(x.shape)
 
         # Multi-row CUDA-graph path (bsz 1..MAX_BSZN): a single cooperative mgemm call per
@@ -1402,6 +1592,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
         # CPU tail partial folds in before the post norms (nonlinear: they must see the
         # complete routed sum)
         final_hidden_states = self.cpu_split_combine(final_hidden_states, cpu_partial, cpu_pending, x)
+        _save_moe_subtrace(self, "routed_pre_reduce", final_hidden_states)
 
         # The post norms are nonlinear, so under TP their inputs must be complete sums, not
         # per-rank partials: reduce the routed and shared contributions separately before the
@@ -1416,6 +1607,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 final_hidden_states,
                 self.intermediate_size > 0 and self.num_local_experts > 0
             )
+        _save_moe_subtrace(self, "routed_post_reduce", final_hidden_states)
 
         # Extra norm (Gemma4)
         if self.routed_post_norm:
@@ -1423,7 +1615,9 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
 
         # Shared experts
         if self.shared_experts and not bc_sh_exp:
+            _save_moe_subtrace(self, "shared_input", x)
             y = self.shared_experts.forward(x, params)
+            _save_moe_subtrace(self, "shared_output", y)
             if pre_norm_reduce:
                 params["backend"].all_reduce(y, True)
             if self.shared_experts_post_norm:
@@ -1438,11 +1632,13 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 final_hidden_states += y
 
         # Output reduction
+        _save_moe_subtrace(self, "pre_output_reduce", final_hidden_states)
         if self.tp_reduce and not pre_norm_reduce:
             params["backend"].all_reduce(
                 final_hidden_states,
                 (self.intermediate_size > 0 and self.num_local_experts > 0) or bool(self.shared_experts)
             )
+        _save_moe_subtrace(self, "output", final_hidden_states)
 
         if out_dtype is not None:
             final_hidden_states = final_hidden_states.to(out_dtype)
@@ -1521,6 +1717,7 @@ class BlockSparseMLP(BlockSparseMLP_CPU, Module):
                 "topk_group": self.topk_group,
                 "act_limit": self.act_limit,
                 "alt_residual_channel": self.alt_residual_channel,
+                "tp_deterministic_reduce": self.tp_deterministic_reduce,
                 "key_tid2eid": self.tid2eid_key,
             },
             # Hash-MoE bootstrap layers (DeepSeek-V4): frozen token->experts table, needed

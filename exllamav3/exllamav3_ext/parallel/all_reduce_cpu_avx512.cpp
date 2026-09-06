@@ -330,6 +330,11 @@ void perform_cpu_reduce_avx512
         }
 
         uint32_t rem_devices = device_mask;
+        static const bool deterministic = [] {
+            const char* e = getenv("EXL3_TP_DETERMINISTIC_REDUCE");
+            return e && strcmp(e, "0") != 0;
+        }();
+        bool arrived_contrib[MAX_DEVICES] = {};
         uint8_t* first_src = nullptr;  // Track first contribution for fused add
         int timeout_spin = 0;
 
@@ -343,8 +348,9 @@ void perform_cpu_reduce_avx512
                 if (cpusum_device_arrived(ctx, device, stage, multi, &no_contrib))
                 {
                     rem_devices &= ~(1 << device);
+                    arrived_contrib[device] = !no_contrib;
 
-                    if (!no_contrib)
+                    if (!deterministic && !no_contrib)
                     {
                         uint8_t* src = host_ptr(device, stage);
                         uint8_t* dst = host_ptr(MAX_DEVICES, stage);
@@ -400,6 +406,34 @@ void perform_cpu_reduce_avx512
                 {
                     printf(" ## CPU reduce process timeout\n");
                     TORCH_CHECK(false, "CPU reduce process timeout");
+                }
+            }
+        }
+
+        // Optional deterministic mode: fold after all ranks have arrived, in ascending
+        // device/rank order. This trades a small amount of latency for repeatable BF16/FP16
+        // wire accumulation and is intended to separate ordering drift from transport cost.
+        if (deterministic)
+        {
+            uint8_t* dst = host_ptr(MAX_DEVICES, stage);
+            bool have = false;
+            for (int device = 0; device < MAX_DEVICES; ++device)
+            {
+                if (!arrived_contrib[device]) continue;
+                uint8_t* src = host_ptr(device, stage);
+                size_t elem_count = CEIL_DIVIDE(stage_size, 128) * 64;
+                if (!have) { memcpy(dst, src, stage_size); have = true; }
+                else
+                {
+                    cpu_reduce_parallel(
+                        nullptr,
+                        wire_dtype == REDUCE_WIRE_FP16 ? fp16_add_inplace_avx512 : bf16_add_inplace_avx512,
+                        (uint16_t*) dst,
+                        nullptr,
+                        (uint16_t*) src,
+                        elem_count,
+                        acc_threads
+                    );
                 }
             }
         }

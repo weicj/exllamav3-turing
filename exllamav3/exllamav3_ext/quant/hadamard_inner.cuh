@@ -291,7 +291,8 @@ void had_hf_r_128_guad_inner
     const half* __restrict__ pre_scale_d,
     const float r_scale,
     const float act_limit,
-    const int act_function
+    const int act_function,
+    const bool input_had
 )
 {
     int t = threadIdx.x & 31;
@@ -346,21 +347,28 @@ void had_hf_r_128_guad_inner
     half4 vu = ((half4*) input_ptr_u)[t];
 
     // Hadamard
-    vu = had(vu);
+    if (!input_had)
+        vu = had(vu);
 
     // Post scale
     int i = blockIdx.y * 32 + t;
-    half4 scales_u = ((half4*) post_scale_u)[i];
-    vu.x = __hmul2(vu.x, scales_u.x);
-    vu.y = __hmul2(vu.y, scales_u.y);
+    if (!input_had)
+    {
+        half4 scales_u = ((half4*) post_scale_u)[i];
+        vu.x = __hmul2(vu.x, scales_u.x);
+        vu.y = __hmul2(vu.y, scales_u.y);
+    }
 
     if (act_function != ACT_RELU2_NOGATE)
     {
         vg = ((half4*) input_ptr_g)[t];
-        vg = had(vg);
-        half4 scales_g = ((half4*) post_scale_g)[i];
-        vg.x = __hmul2(vg.x, scales_g.x);
-        vg.y = __hmul2(vg.y, scales_g.y);
+        if (!input_had)
+        {
+            vg = had(vg);
+            half4 scales_g = ((half4*) post_scale_g)[i];
+            vg.x = __hmul2(vg.x, scales_g.x);
+            vg.y = __hmul2(vg.y, scales_g.y);
+        }
     }
 
     // Activation
@@ -420,7 +428,8 @@ void had_hf_r_128_d_inner
     const half* __restrict__ input_ptr,
     float* __restrict__ output_ptr,
     const half* __restrict__ post_scale,
-    const float r_scale
+    const float r_scale,
+    const bool direct_output
 )
 {
     int t = threadIdx.x & 31;
@@ -466,8 +475,18 @@ void had_hf_r_128_d_inner
     sh[t * 4 + 2] = h2;
     sh[t * 4 + 3] = h3;
     __syncwarp();
-    atomicAdd(output_ptr +  0 + t, sh[ 0 + t]);
-    atomicAdd(output_ptr + 32 + t, sh[32 + t]);
-    atomicAdd(output_ptr + 64 + t, sh[64 + t]);
-    atomicAdd(output_ptr + 96 + t, sh[96 + t]);
+    if (direct_output)
+    {
+        output_ptr[ 0 + t] = sh[ 0 + t];
+        output_ptr[32 + t] = sh[32 + t];
+        output_ptr[64 + t] = sh[64 + t];
+        output_ptr[96 + t] = sh[96 + t];
+    }
+    else
+    {
+        atomicAdd(output_ptr +  0 + t, sh[ 0 + t]);
+        atomicAdd(output_ptr + 32 + t, sh[32 + t]);
+        atomicAdd(output_ptr + 64 + t, sh[64 + t]);
+        atomicAdd(output_ptr + 96 + t, sh[96 + t]);
+    }
 }

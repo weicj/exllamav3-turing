@@ -12,6 +12,7 @@
 #include "hadamard_inner.cuh"
 #include <cooperative_groups.h>
 #include <cstdlib>
+#include <cstdio>
 #include <set>
 #include <map>
 
@@ -20,6 +21,26 @@
 // precision, KL at parity with fp16 or better); 2: plain int8 (cheaper, ~0.9% output RMS deviation).
 static int _exl3_gemv_int8_mode = 0;
 bool _exl3_gemv_int8_mode_chk = false;
+static int _exl3_gemv_int8_trace = -1;
+static uint64_t _exl3_gemv_int8_trace_calls = 0;
+
+static bool exl3_gemv_int8_trace_enabled()
+{
+    if (_exl3_gemv_int8_trace < 0)
+        _exl3_gemv_int8_trace = std::getenv("EXL3_INT8_GEMV_TRACE") ? 1 : 0;
+    return _exl3_gemv_int8_trace != 0;
+}
+
+static void exl3_gemv_int8_trace_hit(
+    int size_m, int size_k, int size_n, int K, bool residual, bool graph, const char* path)
+{
+    if (!exl3_gemv_int8_trace_enabled()) return;
+    uint64_t call = _exl3_gemv_int8_trace_calls++;
+    if (call < 512)
+        std::fprintf(stderr, "EXL3_INT8_GEMV_HIT call=%llu path=%s m=%d k=%d n=%d K=%d residual=%d graph=%d\n",
+                     (unsigned long long) call, path, size_m, size_k, size_n, K,
+                     residual ? 1 : 0, graph ? 1 : 0);
+}
 
 static int exl3_gemv_int8_mode()
 {
@@ -129,7 +150,7 @@ static bool exl3_gemv_int8_sq
     void* fn = select_gemv_int8_sq_kernel(K, M, c_fp32, residual);
     if (!fn) return false;
 
-    int rows_max = gemv_int8_sq_rows_max(M, residual);
+    int rows_max = gemv_int8_sq_rows_max(M, residual, K);
 
     // Mirror of the kernel's work decomposition (single-wave rule with a half-wave floor)
     auto decomp = [&] (int grid_, int& ksplit, int& rows_per)
@@ -145,7 +166,7 @@ static bool exl3_gemv_int8_sq
     };
     auto smem_for = [&] (int rows_per) -> size_t
     {
-        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        size_t stage = gemv_int8_stage_bytes(K);
         return (size_t) rows_per * 16 * 2 + (size_t) rows_per * 16 * 4 * M * (residual ? 2 : 1)
                + stage + (size_t) 2 * M * 128 * 4;
     };
@@ -243,14 +264,10 @@ bool exl3_gemv_int8
     cudaGetDevice(&device);
     if (K < 1 || K > exl3_gemv_int8_max_k(device)) return false;
 
-    // Both int8 kernels below size their shared memory against a fixed ~80 KB budget baked into
-    // gemv_int8_sq_rows_max() and the coop path's 768-row bound, and - critically - the kernels
-    // recompute rows_per from those same constants on the device, so the host cannot simply ask
-    // for less without desyncing the two. On Turing (64 KB) the cudaFuncSetAttribute would fail
-    // and the following cuda_check would abort the process. This path is a decode-time
-    // optimization over the regular fp16 tensor-core kernel, which handles the same work, so
-    // declining is a performance loss and nothing more.
-    if (DevCtx::instance().get_smem_max(device) < 80 * 1024) return false;
+    // The sq path was originally gated at 80 KiB, which disabled it on Turing even though the
+    // actual 2.05 bpw layouts fit in the device's 64 KiB limit.  The rows-per calculation below
+    // now accounts for the selected K/residual staging bytes and stays within this limit.
+    if (DevCtx::instance().get_smem_max(device) < GEMV_INT8_SMEM_LIMIT) return false;
 
     int num_sms = DevCtx::instance().get_num_sms(device);
     bool c_fp32 = C.dtype() == at::kFloat;
@@ -265,7 +282,10 @@ bool exl3_gemv_int8
         size_m, size_k, size_n, K, c_fp32, residual,
         (const half*) suh->data_ptr(), (half*) A_had->data_ptr(), (const half*) svh->data_ptr(),
         device, num_sms, stream, graph))
+    {
+        exl3_gemv_int8_trace_hit(size_m, size_k, size_n, K, residual, graph, "sq");
         return true;
+    }
     if (size_m > 1) return false;
 
     void* fn = select_gemv_int8_kernel(K, c_fp32, residual);
@@ -282,14 +302,14 @@ bool exl3_gemv_int8
         ksplit = MAX(ksplit, CEIL_DIVIDE(rows_total, smem_rows_max));
         ksplit = MIN(ksplit, rows_total);
         int rows_per = CEIL_DIVIDE(rows_total, ksplit);
-        size_t stage = gemv_int8_stage_smem(K) ? (size_t) 8 * GEMV_STAGE_D * 16 * K * 4 : 0;
+        size_t stage = gemv_int8_stage_bytes(K);
         return MAX((size_t) rows_per * 16 * 4 * (residual ? 2 : 1) + stage, (size_t) 8 * 128 * 4);
     };
 
     if (gemv_attr_set[device].find(fn) == gemv_attr_set[device].end())
     {
         // Upper bound over all shapes: smem_rows_max * 64 B
-        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, 768 * 16 * 4 + GEMV_STAGE_MAX_BYTES);
+        cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, GEMV_INT8_SMEM_LIMIT);
         // Match the tensor-core kernels' shared-memory carveout: these kernels interleave with
         // them (hundreds of launches per decoded token), and a smaller carveout would make the GPU
         // drain and reconfigure the SMs on every transition - measured at ~4 us per launch in
@@ -363,5 +383,6 @@ bool exl3_gemv_int8
         cudaGetLastError();
         return false;
     }
+    exl3_gemv_int8_trace_hit(size_m, size_k, size_n, K, residual, graph, "coop");
     return true;
 }

@@ -475,8 +475,11 @@ void cuda_recurrent_gated_delta_rule_kernel
     __shared__ float sh_red[2][MAX_HEAD_DIM / 32];
     __shared__ float sh_k[MAX_HEAD_DIM];
     __shared__ float sh_q[MAX_HEAD_DIM];
-    __shared__ float sh_dot1[MAX_HEAD_DIM];
-    __shared__ float sh_dot2[MAX_HEAD_DIM];
+    // One partial sum per SUBK row. Using atomicAdd here makes the order of the
+    // floating-point reduction scheduler-dependent, which is observable after a
+    // long recurrent prefill. The rank-zero row combines the fixed four terms.
+    __shared__ float sh_dot1[SUBK][MAX_HEAD_DIM];
+    __shared__ float sh_dot2[SUBK][MAX_HEAD_DIM];
 
     // Iterate over sequence dim
     for (int s = 0; s < seqlen; ++s)
@@ -571,14 +574,6 @@ void cuda_recurrent_gated_delta_rule_kernel
             }
         }
 
-        if (t < v_chunk_dim && bt == 0)
-        {
-            if constexpr (!MAMBA2)
-                sh_dot1[t] = 0.0f;
-            sh_dot2[t] = 0.0f;
-        }
-        __syncthreads();
-
         if constexpr (!MAMBA2)
         {
             if (t < v_chunk_dim)
@@ -594,7 +589,17 @@ void cuda_recurrent_gated_delta_rule_kernel
                     for (int j = 0; j < 8; ++j, rs_rd += v_head_dim, sh_k_rd++)
                         sum = sum + *sh_k_rd * *rs_rd;
                 }
-                atomicAdd(sh_dot1 + t, sum);
+                sh_dot1[bt][t] = sum;
+            }
+            __syncthreads();
+
+            if (t < v_chunk_dim && bt == 0)
+            {
+                float sum = 0.0f;
+                #pragma unroll
+                for (int i = 0; i < SUBK; ++i)
+                    sum += sh_dot1[i][t];
+                sh_dot1[0][t] = sum;
             }
             __syncthreads();
         }
@@ -607,7 +612,7 @@ void cuda_recurrent_gated_delta_rule_kernel
             // Read v head; delta rule subtracts the decayed state readback, Mamba2 injects raw v
             float v = __bfloat162float(gl_v[t]);
             if constexpr (!MAMBA2)
-                v -= sh_dot1[t] * g_h;
+                v -= sh_dot1[0][t] * g_h;
 
             // Update step
             float v_out = 0.0f;
@@ -630,13 +635,16 @@ void cuda_recurrent_gated_delta_rule_kernel
                     v_out = v_out + *sh_q_rd * state;
                 }
             }
-            atomicAdd(sh_dot2 + t, v_out);
+            sh_dot2[bt][t] = v_out;
         }
         __syncthreads();
 
         if (t < v_chunk_dim && bt == 0)
         {
-            float v_out = sh_dot2[t];
+            float v_out = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < SUBK; ++i)
+                v_out += sh_dot2[i][t];
 
             // Store attn output
             if constexpr (MAMBA2)
@@ -707,8 +715,10 @@ void cuda_recurrent_gated_delta_rule_kernel_128
     __shared__ float sh_red[2][HEAD_DIM / 32];
     __shared__ float sh_k[HEAD_DIM];
     __shared__ float sh_q[HEAD_DIM];
-    __shared__ float sh_dot1[HEAD_DIM];
-    __shared__ float sh_dot2[HEAD_DIM];
+    // Keep each SUBK row separate and reduce in a defined order. See the generic
+    // kernel above for why atomic shared-memory accumulation is unsuitable here.
+    __shared__ float sh_dot1[SUBK][HEAD_DIM];
+    __shared__ float sh_dot2[SUBK][HEAD_DIM];
     __shared__ float sh_g[CHANNELWISE ? HEAD_DIM : 1];
 
     for (int s = 0; s < seqlen; ++s)
@@ -770,13 +780,6 @@ void cuda_recurrent_gated_delta_rule_kernel_128
         if constexpr (CHANNELWISE)
             sh_g[t] = __expf(g[head * HEAD_DIM + t]);
 
-        if (t < V_CHUNK_DIM && bt == 0)
-        {
-            sh_dot1[t] = 0.0f;
-            sh_dot2[t] = 0.0f;
-        }
-        __syncthreads();
-
         if (t < V_CHUNK_DIM)
         {
             float sum = 0.0f;
@@ -797,7 +800,17 @@ void cuda_recurrent_gated_delta_rule_kernel_128
                         sum = sum + *sh_k_rd * *rs_rd;
                 }
             }
-            atomicAdd(sh_dot1 + t, sum);
+            sh_dot1[bt][t] = sum;
+        }
+        __syncthreads();
+
+        if (t < V_CHUNK_DIM && bt == 0)
+        {
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < SUBK; ++i)
+                sum += sh_dot1[i][t];
+            sh_dot1[0][t] = sum;
         }
         __syncthreads();
 
@@ -806,7 +819,7 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             float g_h = CHANNELWISE ? 1.0f : __expf(g[head]);
             float beta_h = __bfloat162float(beta[head]);
             // CHANNELWISE: sh_dot1 already read the decayed state, no head-wide factor
-            float v = __bfloat162float(gl_v[t]) - sh_dot1[t] * g_h;
+            float v = __bfloat162float(gl_v[t]) - sh_dot1[0][t] * g_h;
             float v_out = 0.0f;
             float* sh_k_rd = sh_k + bt * BTS;
             float* sh_g_rd = sh_g + bt * BTS;
@@ -826,12 +839,18 @@ void cuda_recurrent_gated_delta_rule_kernel_128
                     v_out = v_out + *sh_q_rd * state;
                 }
             }
-            atomicAdd(sh_dot2 + t, v_out);
+            sh_dot2[bt][t] = v_out;
         }
         __syncthreads();
 
         if (t < V_CHUNK_DIM && bt == 0)
-            out[t] = __float2bfloat16_rz(sh_dot2[t] * scale);
+        {
+            float v_out = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < SUBK; ++i)
+                v_out += sh_dot2[i][t];
+            out[t] = __float2bfloat16_rz(v_out * scale);
+        }
 
         mixed_qkv +=        2 * HEAD_DIM * num_k_heads + HEAD_DIM * num_v_heads;
         g +=                num_v_heads * (CHANNELWISE ? HEAD_DIM : 1);

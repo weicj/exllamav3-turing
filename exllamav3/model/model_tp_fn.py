@@ -16,6 +16,12 @@ from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
 
 _no_fwd_barrier = os.environ.get("EXL3_TP_NO_FWD_BARRIER", "1") != "0"
+# Worker acknowledgements normally fence the owning CUDA stream before the result is
+# sent over the multiprocessing pipe.  Keep that safety default, but allow a measured
+# fast path: TP forward dispatch already has explicit lifetime fences, and this switch
+# lets us separate CUDA-stream synchronization cost from NCCL/kernel cost.  It is
+# intentionally opt-in so correctness/lifetime semantics are unchanged by default.
+_sync_worker_cuda = os.environ.get("EXL3_TP_SYNC_AFTER_CALL", "1") != "0"
 _trace_dir = os.environ.get("EXL3_MODULE_TRACE_DIR")
 _trace_phase = os.environ.get("EXL3_MODULE_TRACE_PHASE", "decode")
 _trace_pass = int(os.environ.get("EXL3_MODULE_TRACE_PASS", "0"))
@@ -23,6 +29,17 @@ _trace_stop_after_module = int(os.environ.get("EXL3_TRACE_STOP_AFTER_MODULE", "-
 _module_profile_dir = os.environ.get("EXL3_TP_MODULE_PROFILE_DIR")
 _module_profile_phase = os.environ.get("EXL3_TP_MODULE_PROFILE_PHASE", "decode")
 _module_profile_pass = int(os.environ.get("EXL3_TP_MODULE_PROFILE_PASS", "0"))
+# Optional Nsight capture range. The TP workers own the CUDA streams, so the range must be
+# started in this dispatch function rather than in the parent benchmark process.
+_cuda_profile_phase = os.environ.get("EXL3_CUDA_PROFILE_PHASE")
+_cuda_profile_pass = int(os.environ.get("EXL3_CUDA_PROFILE_PASS", "-1"))
+_module_hash_trace_path = os.environ.get("EXL3_TP_MODULE_HASH_TRACE_JSONL")
+_module_hash_trace_phase = os.environ.get("EXL3_TP_MODULE_HASH_TRACE_PHASE", "prefill")
+_module_hash_trace_rank = int(os.environ.get("EXL3_TP_MODULE_HASH_TRACE_RANK", "-1"))
+_module_hash_trace_modules = {
+    int(value) for value in os.environ.get("EXL3_TP_MODULE_HASH_TRACE_MODULES", "").split(",") if value
+}
+_module_hash_trace_exact = os.environ.get("EXL3_TP_MODULE_HASH_TRACE_EXACT", "0") != "0"
 _boundary_trace_path = os.environ.get("EXL3_TP_BOUNDARY_TRACE_JSONL")
 _boundary_trace_phase = os.environ.get("EXL3_TP_BOUNDARY_TRACE_PHASE", "prefill")
 _boundary_trace_pass = int(os.environ.get("EXL3_TP_BOUNDARY_TRACE_PASS", "-1"))
@@ -32,8 +49,21 @@ _boundary_trace_pass = int(os.environ.get("EXL3_TP_BOUNDARY_TRACE_PASS", "-1"))
 # storage and recurrent state slots. CUDA launches are asynchronous, so every
 # CUDA worker command must report completion only after its stream is finished.
 def _sync_after_cuda_call(func, device):
-    if device is not None and device >= 0:
+    if _sync_worker_cuda and device is not None and device >= 0:
         torch.cuda.synchronize(device)
+
+
+def _cuda_profile_start():
+    """Start an opt-in CUDA profiler range in the owning TP worker."""
+    result = torch.cuda.cudart().cudaProfilerStart()
+    if result != 0:
+        raise RuntimeError(f"cudaProfilerStart failed: {result}")
+
+
+def _cuda_profile_stop():
+    result = torch.cuda.cudart().cudaProfilerStop()
+    if result != 0:
+        raise RuntimeError(f"cudaProfilerStop failed: {result}")
 
 
 def _save_boundary_trace(local_context: dict, phase: str, pass_idx: int, stage: str, tensor: torch.Tensor):
@@ -79,7 +109,62 @@ def _save_module_trace(kind: str, device: int, pass_idx: int, module_idx: int, m
     }, path)
 
 
-def _save_module_profile(local_context: dict, phase: str, pass_idx: int, events: list):
+def _save_module_hash_trace(
+    local_context: dict,
+    phase: str,
+    pass_idx: int,
+    module_idx: int,
+    module,
+    x: torch.Tensor,
+):
+    """Trace module outputs without retaining the large prefill activations."""
+    if _module_hash_trace_path is None or phase != _module_hash_trace_phase:
+        return
+    if _module_hash_trace_rank >= 0 and local_context["rank"] != _module_hash_trace_rank:
+        return
+    if _module_hash_trace_modules and module_idx not in _module_hash_trace_modules:
+        return
+    # The last KV-producing prefill module is permitted to return no activation; its caller
+    # exits immediately afterwards. Hash tracing must not turn that valid control path into an
+    # AttributeError.
+    if x is None:
+        return
+    xf = x.detach().float()
+    # A small GPU-side fingerprint locates the first divergent block without copying every
+    # 4K hyper-connection activation to the CPU. Exact SHA-256 remains available per module.
+    fingerprint = torch.stack((
+        xf.sum(dtype = torch.float64),
+        xf.abs().sum(dtype = torch.float64),
+        xf.square().sum(dtype = torch.float64),
+        xf.max().to(torch.float64),
+        xf.min().to(torch.float64),
+        torch.isfinite(xf).sum(dtype = torch.float64),
+    )).cpu().tolist()
+    row = {
+        "pass": pass_idx,
+        "rank": local_context["rank"],
+        "module": module_idx,
+        "key": module.key,
+        "shape": list(x.shape),
+        "dtype": str(x.dtype),
+        "fingerprint": fingerprint,
+    }
+    if _module_hash_trace_exact:
+        if x.device.type == "cuda":
+            torch.cuda.synchronize(x.device)
+        bits = x.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        row["sha256"] = hashlib.sha256(bits).hexdigest()
+    with open(f"{_module_hash_trace_path}.r{local_context['rank']}", "a") as handle:
+        handle.write(json.dumps(row, sort_keys = True) + "\n")
+
+
+def _save_module_profile(
+    local_context: dict,
+    phase: str,
+    pass_idx: int,
+    events: list,
+    submodule_events: list | None = None,
+):
     if not events:
         return
     torch.cuda.synchronize(local_context["device"])
@@ -90,6 +175,14 @@ def _save_module_profile(local_context: dict, phase: str, pass_idx: int, events:
             "cuda_ms": start.elapsed_time(end),
         }
         for index, key, start, end in events
+    ]
+    submodule_rows = [
+        {
+            "key": key,
+            "stage": stage,
+            "cuda_ms": start.elapsed_time(end),
+        }
+        for key, stage, start, end in (submodule_events or [])
     ]
     path = os.path.join(
         _module_profile_dir,
@@ -103,6 +196,7 @@ def _save_module_profile(local_context: dict, phase: str, pass_idx: int, events:
             "pass": pass_idx,
             "total_cuda_ms": sum(row["cuda_ms"] for row in rows),
             "modules": rows,
+            "submodules": submodule_rows,
         }, f, indent = 2)
 
 
@@ -147,7 +241,7 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
                 init_method = backend_args["init_method"],  ##
                 master = master,
                 uuid = backend_args["uuid"],
-                cpu = device < 0
+                cpu = device < 0,
             )
         case _:
             raise ValueError("Unknown backend type")
@@ -328,11 +422,17 @@ def mp_model_forward(
     phase = "prefill" if prefill else "decode"
     profile_pass_idx = local_context.get(f"module_profile_{phase}_pass", 0)
     local_context[f"module_profile_{phase}_pass"] = profile_pass_idx + 1
+    capture_cuda_profile = _cuda_profile_phase == phase and profile_pass_idx == _cuda_profile_pass
     profile_this_pass = _module_profile_dir is not None and _module_profile_phase == phase \
         and profile_pass_idx == _module_profile_pass
     if profile_this_pass:
         os.makedirs(_module_profile_dir, exist_ok = True)
         module_events = []
+        # TransformerBlock records its internal attention/MoE/hyperconnection spans here.
+        # The list only exists for the explicitly selected diagnostic pass, so normal TP
+        # forwards do not allocate events or take profiling branches.
+        submodule_events = []
+        params["_tp_submodule_profile"] = submodule_events
 
     for tensor_param in [
         "block_table",
@@ -353,6 +453,8 @@ def mp_model_forward(
 
     params["backend"] = backend
 
+    if capture_cuda_profile:
+        _cuda_profile_start()
     x = consumer.recv(shared_input)
     _save_boundary_trace(local_context, phase, pass_idx, "shared_input", x)
 
@@ -372,6 +474,7 @@ def mp_model_forward(
         if idx <= 2:
             _save_boundary_trace(local_context, phase, pass_idx, f"prepared:{idx}:{module.key}", x)
         x = module.forward(x, params)
+        _save_module_hash_trace(local_context, phase, pass_idx, idx, module, x)
         if idx <= 1:
             _save_boundary_trace(local_context, phase, pass_idx, f"output:{idx}:{module.key}", x)
         if _module_profile_dir is not None:
@@ -384,19 +487,34 @@ def mp_model_forward(
         if prefill and idx == _trace_stop_after_module:
             backend.end_cpu_reduce_jobs()
             if profile_this_pass:
-                _save_module_profile(local_context, phase, profile_pass_idx, module_events)
+                _save_module_profile(
+                    local_context, phase, profile_pass_idx, module_events,
+                    params.pop("_tp_submodule_profile"),
+                )
+            if capture_cuda_profile:
+                _cuda_profile_stop()
             del params["prefill"]
             return None
         if prefill and idx == last_kv_module_idx:
             backend.end_cpu_reduce_jobs()
             if profile_this_pass:
-                _save_module_profile(local_context, phase, profile_pass_idx, module_events)
+                _save_module_profile(
+                    local_context, phase, profile_pass_idx, module_events,
+                    params.pop("_tp_submodule_profile"),
+                )
+            if capture_cuda_profile:
+                _cuda_profile_stop()
             del params["prefill"]
             return None
 
     backend.end_cpu_reduce_jobs()
     if profile_this_pass:
-        _save_module_profile(local_context, phase, profile_pass_idx, module_events)
+        _save_module_profile(
+            local_context, phase, profile_pass_idx, module_events,
+            params.pop("_tp_submodule_profile"),
+        )
+    if capture_cuda_profile:
+        _cuda_profile_stop()
     return x
 
 

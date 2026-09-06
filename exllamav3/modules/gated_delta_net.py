@@ -30,12 +30,21 @@ _skip_recurrent_clear_sync = os.environ.get("EXL3_SKIP_RECURRENT_CLEAR_SYNC", "0
 _gdn_subtrace_dir = os.environ.get("EXL3_GDN_SUBTRACE_DIR")
 _gdn_subtrace_path = os.environ.get("EXL3_GDN_SUBTRACE_JSONL")
 _gdn_subtrace_layer = int(os.environ.get("EXL3_GDN_SUBTRACE_LAYER", "-1"))
+_gdn_subtrace_stages = {
+    value for value in os.environ.get("EXL3_GDN_SUBTRACE_STAGES", "").split(",") if value
+}
+_gdn_subtrace_call_filter = {
+    int(value) for value in os.environ.get("EXL3_GDN_SUBTRACE_CALLS", "").split(",") if value
+}
 _gdn_subtrace_calls = {}
 _gdn_subtrace_current_calls = {}
 
 
 def _gdn_subtrace_sha256(tensor: torch.Tensor) -> str:
-    bits = tensor.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+    # ``contiguous`` may retain an arbitrary stride for a size-one trailing axis.
+    # Dtype reinterpretation requires that final stride to be one, so flatten before
+    # exposing the bf16 storage as bytes.
+    bits = tensor.detach().reshape(-1).contiguous().view(torch.uint8).cpu().numpy().tobytes()
     return hashlib.sha256(bits).hexdigest()
 
 
@@ -43,13 +52,19 @@ def _save_gdn_subtrace(module, stage: str, tensor: torch.Tensor):
     """Persist GDN head-sharded intermediates for PP/TP reconstruction checks."""
     if (_gdn_subtrace_dir is None and _gdn_subtrace_path is None) or module.layer_idx != _gdn_subtrace_layer:
         return
+    # Keep invocation counting independent of selected stages, so callers can inspect
+    # just the recurrence boundaries of selected decode calls.
+    if stage == "input":
+        call = _gdn_subtrace_calls.get(module.key, 0)
+        _gdn_subtrace_calls[module.key] = call + 1
+        _gdn_subtrace_current_calls[module.key] = call
+    else:
+        call = _gdn_subtrace_current_calls.get(module.key, -1)
+    if _gdn_subtrace_call_filter and call not in _gdn_subtrace_call_filter:
+        return
+    if _gdn_subtrace_stages and stage not in _gdn_subtrace_stages:
+        return
     if _gdn_subtrace_path is not None:
-        if stage == "qkv":
-            call = _gdn_subtrace_calls.get(module.key, 0)
-            _gdn_subtrace_calls[module.key] = call + 1
-            _gdn_subtrace_current_calls[module.key] = call
-        else:
-            call = _gdn_subtrace_current_calls.get(module.key, -1)
         row = {
             "call": call,
             "key": module.key,
@@ -58,17 +73,24 @@ def _save_gdn_subtrace(module, stage: str, tensor: torch.Tensor):
             "dtype": str(tensor.dtype),
             "sha256": _gdn_subtrace_sha256(tensor),
         }
-        with open(_gdn_subtrace_path, "a") as handle:
+        # TP worker processes have distinct CUDA device indices. Keep their writes isolated
+        # so concurrent prefill traces preserve a reliable per-rank call sequence.
+        trace_path = f"{_gdn_subtrace_path}.d{tensor.device.index}"
+        with open(trace_path, "a") as handle:
             handle.write(json.dumps(row, sort_keys=True) + "\n")
     if _gdn_subtrace_dir is not None:
         os.makedirs(_gdn_subtrace_dir, exist_ok = True)
         mode = os.environ.get("EXL3_TRACE_MODE", "unknown")
         device = str(tensor.device).replace(":", "_")
         torch.save({
+            "call": call,
             "stage": stage,
             "shape": tuple(tensor.shape),
             "tensor": tensor.detach().float().cpu().contiguous(),
-        }, os.path.join(_gdn_subtrace_dir, f"{mode}-{device}-l{module.layer_idx:03d}-{stage}.pt"))
+        }, os.path.join(
+            _gdn_subtrace_dir,
+            f"{mode}-{device}-l{module.layer_idx:03d}-c{call:03d}-{stage}.pt",
+        ))
 
 
 def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
@@ -947,6 +969,7 @@ class GatedDeltaNet(Module):
 
         bsz, seqlen, _ = x.shape
         save_history = params.get("recurrent_history", False)
+        _save_gdn_subtrace(self, "input", x)
 
         # Post load, fuse conv1d weights if needed
         if self.conv1d_weight is None:
@@ -977,6 +1000,16 @@ class GatedDeltaNet(Module):
             conv_state, recurrent_state = None, None
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
+
+        if conv_state is not None:
+            _save_gdn_subtrace(self, "conv_state_pre", conv_state)
+            _save_gdn_subtrace(self, "recurrent_state_pre", recurrent_state)
+            if recurrent_slots is not None:
+                # The backing tensors contain every cache slot. Hash only the slot(s) read by
+                # this invocation so traces can compare two fresh requests without unrelated,
+                # previously-used slots obscuring their state.
+                _save_gdn_subtrace(self, "conv_state_active_pre", conv_state.index_select(0, recurrent_slots))
+                _save_gdn_subtrace(self, "recurrent_state_active_pre", recurrent_state.index_select(0, recurrent_slots))
 
         # Deferred fill of the merged b/a projection (weights are materialized by now)
         if self.bc_split and not self.ba_weight_filled and self.kda:
@@ -1029,6 +1062,8 @@ class GatedDeltaNet(Module):
         if self.qkvz_proj is not None and self.ba_proj is not None:
             qkvz = self.qkvz_proj.forward(x, params)
             ba = self.ba_proj.forward(x, params)
+            _save_gdn_subtrace(self, "qkvz", qkvz)
+            _save_gdn_subtrace(self, "ba", ba)
 
             mixed_qkv = torch.empty((bsz, self.fdim_qkv, seqlen), dtype = torch.bfloat16, device = self.device)
             z = torch.empty((bsz, seqlen, self.num_v_heads, self.v_head_dim), dtype = torch.bfloat16, device = self.device)
@@ -1046,6 +1081,7 @@ class GatedDeltaNet(Module):
                 self.v_head_dim,
                 self.beta_scale
             )
+            _save_gdn_subtrace(self, "z", z)
         elif self.kda:
             qkv = self.qkv_proj.forward(x, params)
             mixed_qkv = qkv.transpose(1, 2).to(torch.bfloat16).contiguous()
@@ -1091,6 +1127,10 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
 
+        _save_gdn_subtrace(self, "mixed_pre_conv", mixed_qkv)
+        _save_gdn_subtrace(self, "beta", beta)
+        _save_gdn_subtrace(self, "g", g)
+
         # Convolution
         mixed_qkv = causal_conv1d_update(
             mixed_qkv = mixed_qkv,
@@ -1101,6 +1141,11 @@ class GatedDeltaNet(Module):
             history = save_history,
             params = params,
         )
+        _save_gdn_subtrace(self, "mixed_post_conv", mixed_qkv)
+        if conv_state is not None:
+            _save_gdn_subtrace(self, "conv_state_post", conv_state)
+            if recurrent_slots is not None:
+                _save_gdn_subtrace(self, "conv_state_active_post", conv_state.index_select(0, recurrent_slots))
 
         # Delta rule
         core_attn_out = gated_delta_rule_fn(
@@ -1121,6 +1166,10 @@ class GatedDeltaNet(Module):
             channelwise_g = self.kda,
         )
         _save_gdn_subtrace(self, "core", core_attn_out)
+        if recurrent_state is not None:
+            _save_gdn_subtrace(self, "recurrent_state_post", recurrent_state)
+            if recurrent_slots is not None:
+                _save_gdn_subtrace(self, "recurrent_state_active_post", recurrent_state.index_select(0, recurrent_slots))
 
         # Norm
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)

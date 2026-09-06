@@ -11,7 +11,10 @@ from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
 from exllamav3.generator.sampler import GreedySampler
 
 
-MODEL_DIR = "/mnt/nvme/models/turboderp-Qwen3.8-Flash-Next-exl3/2.05bpw_h4_ng4"
+MODEL_DIR = os.environ.get(
+    "BENCH_MODEL_DIR",
+    "/mnt/nvme/models/turboderp-Qwen3.8-Flash-Next-exl3/2.05bpw_h4_ng4",
+)
 PROMPT_TOKENS = 4096
 OUTPUT_TOKENS = int(os.environ.get("BENCH_OUTPUT_TOKENS", "128"))
 CACHE_TOKENS = 4608

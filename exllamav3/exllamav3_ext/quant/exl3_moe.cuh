@@ -15,6 +15,7 @@ void exl3_moe
 
     const at::Tensor& temp_state_g,
     const at::Tensor& temp_state_u,
+    const at::Tensor& temp_state_d,
     const at::Tensor& temp_intermediate_g,
     const at::Tensor& temp_intermediate_u,
 
@@ -42,6 +43,6 @@ void exl3_moe
     const bool down_mul1,
 
     const float act_limit,
-    const int num_active
+    const int num_active,
+    const bool direct_output
 );
-

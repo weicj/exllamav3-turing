@@ -426,6 +426,25 @@ window (e.g. `4`) catches it with no wake cost, at the price of one busy core pe
 window. `0` disables the spin. Mostly useful on hosts where TP profiling shows a large stagger
 between the main process and child workers reaching their first kernel launch.
 
+### `EXL3_TP_SYNC_AFTER_CALL` (default: `1`)
+
+Fence each CUDA TP worker command with `torch.cuda.synchronize()` before sending its
+acknowledgement. Set to `0` only for performance diagnosis; the default remains enabled because
+the acknowledgement is also a lifetime fence for shared input, KV and recurrent-state storage.
+
+### `EXL3_TP_ASYNC_ALLREDUCE` (default: `0`)
+
+Pass `async_op=True` to NCCL all-reduce calls so Python does not synchronously wait after each
+small collective. CUDA stream ordering still enforces tensor dependencies, and the worker
+end-of-forward fence closes the lifetime boundary. Experimental; use only with a fresh quality
+check because it changes host scheduling and collective progress behavior.
+
+### `EXL3_TP_DETERMINISTIC_REDUCE` (default: `0`)
+
+For the native CPU-assisted backend, fold received rank contributions in fixed device order
+instead of arrival order. This is a diagnostic correctness mode; it does not restore FP32 exact
+transport because FP32 payloads still use the BF16 wire format.
+
 ## Debug
 
 ### `EXL3_NGRAM_GATHER_PROF` (default: unset)
@@ -465,3 +484,34 @@ kernel with the kernel name, source line and bad index instead of corrupting mem
 faulting asynchronously downstream. Debug tool for paged-pool issues; significant JIT
 overhead (forces Triton debug mode globally), leave unset in production. AOT/BC graph
 kernels are unaffected (compiled with asserts off).
+
+### `EXL3_QSA_PREFILL_DENSE` (default: `0`)
+
+Experimental SM75 policy for Qwen3.8 Flash-Next. With `1`, cached QSA prefills larger than
+the BC decode graph limit use dense attention through the normal dispatcher (FlashInfer FA2
+when available), while the QSA raw/pooled cache planes are still updated. Single-token and
+other graph-sized decode calls continue to use BC/Triton QSA sparse attention. For a 4K
+prefill, allow enough FlashInfer workspace with `EXL3_FLASHINFER_WORKSPACE_MB=128` or larger.
+
+### `EXL3_QSA_BC_FORCE_DENSE` (default: `0`)
+
+Diagnostic Qwen3.8 Flash-Next decode policy. With `1`, an armed BC-QSA module keeps its
+cache-plane updates and CUDA graph but uses its dense attention regime after the normal sparse
+threshold. This differs from `EXL3_QSA_DISABLE_SPARSE=1`, which falls back to eager attention.
+It changes model attention semantics and is for performance A/B only.
+
+### `EXL3_MOE_DETERMINISTIC_REDUCE` (default: architecture-dependent)
+
+Diagnostic deterministic MoE reduction. With `1`, routed expert contributions are materialized
+per top-k assignment and summed in a fixed order, avoiding the fused kernel's floating-point
+`atomicAdd` ordering drift. Qwen3.8 Flash-Next enables the vectorized fixed-order
+`expert_sum` reduction automatically for TP workers; all other architectures retain the normal
+fused reduction. Set this variable explicitly to `0` or `1` to override that policy. The
+deterministic path uses extra temporary storage; `EXL3_MOE_DETERMINISTIC_REDUCE_MODE` can
+explicitly select a different reduction order for diagnostics.
+
+### `EXL3_QSA_TRACE` and `EXL3_ATTN_DISPATCH_TRACE` (default: `0`)
+
+Diagnostics for the staged policy. The first variable prints each QSA layer's dense/sparse
+decision; the second prints the first backend selected for each attention shape. They do not
+change numerical behavior.

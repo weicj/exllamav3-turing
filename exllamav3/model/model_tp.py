@@ -620,7 +620,15 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
-        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+        # The native backend uses the CPU helper to complete its host-assisted reduce
+        # pipeline.  NCCL has no CPU reduce work; dispatching a no-op command to the
+        # helper on every forward only adds a multiprocessing pipe round-trip and an
+        # extra deferred ack (particularly visible during single-token decode).
+        # ``native`` uses the host-assisted reducer; NCCL has no CPU helper
+        # command in the forward schedule.
+        use_cpu_reduce = self.tp_backend == "native"
+        if use_cpu_reduce:
+            self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
         # active_devices order sends work to spawned CUDA workers first and the main-process output device last.
@@ -640,7 +648,8 @@ class Model_TPMixin:
         r = self.tp_worker_result(self.tp_output_device)
         assert r is None, "TP logic error"
         self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
-        self.tp_pending_acks.append(-1)
+        if use_cpu_reduce:
+            self.tp_pending_acks.append(-1)
         # See forward_tp: the exported recurrent-state handles must outlive the deferred acks
         self.tp_pending_refs = (args, params.get("recurrent_states"))
         if not _defer_forward_acks:
@@ -656,7 +665,11 @@ class Model_TPMixin:
         last_kv_module_idx: int,
         modules: list,
     ):
-        self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
+        # See prefill_tp(): NCCL does not use the CPU helper, so skip the no-op
+        # dispatch/ack pair while preserving the native backend's reduce schedule.
+        use_cpu_reduce = self.tp_backend == "native"
+        if use_cpu_reduce:
+            self.tp_worker_dispatch(-1, mp_cpu_reduce, ())
 
         x, reserve = self.prepare_inputs_for_tp(x, params)
         # Keep the output-device pseudo-worker last for the same reason as prefill_tp(): its send() path executes
@@ -676,7 +689,8 @@ class Model_TPMixin:
         out = self.tp_worker_result(self.tp_output_device)
         assert out is not None, "TP logic error"
         self.tp_pending_acks = [d for d in self.active_devices if d != self.tp_output_device]
-        self.tp_pending_acks.append(-1)
+        if use_cpu_reduce:
+            self.tp_pending_acks.append(-1)
         # Pin the exported recurrent-state handles too: restore_tp_params swaps them out of the
         # params dict in place, so holding args alone would not keep their shared storages alive
         self.tp_pending_refs = (args, params.get("recurrent_states"))

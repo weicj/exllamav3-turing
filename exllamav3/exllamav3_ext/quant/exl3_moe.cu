@@ -106,6 +106,7 @@ void exl3_moe
 
     const at::Tensor& temp_state_g,
     const at::Tensor& temp_state_u,
+    const at::Tensor& temp_state_d,
     const at::Tensor& temp_intermediate_g,
     const at::Tensor& temp_intermediate_u,
 
@@ -133,7 +134,8 @@ void exl3_moe
     const bool down_mul1,
 
     const float act_limit,
-    const int num_active
+    const int num_active,
+    const bool direct_output
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(hidden_state.device());
@@ -149,7 +151,8 @@ void exl3_moe
     size_t hidden_dim = hidden_state.size(1);
 
     TORCH_CHECK_DTYPE(output_state, kFloat);
-    TORCH_CHECK_SHAPES_FULL(output_state, hidden_state);
+    TORCH_CHECK_DIM(output_state, 2);
+    TORCH_CHECK(output_state.size(1) == hidden_dim, "Output hidden dimension mismatch");
 
     TORCH_CHECK_DTYPE(expert_count, kLong);
     TORCH_CHECK_DIM(expert_count, 1);
@@ -159,12 +162,21 @@ void exl3_moe
     TORCH_CHECK_DIM(token_sorted, 1);
     TORCH_CHECK_SHAPES_FULL(token_sorted, weight_sorted);
     size_t num_experts_per_tok = token_sorted.size(0) / bsz;
+    TORCH_CHECK(
+        output_state.size(0) == (direct_output ? token_sorted.size(0) : bsz),
+        "Output row count does not match MoE scatter mode"
+    );
 
     TORCH_CHECK_DTYPE(temp_state_g, kHalf);
     TORCH_CHECK_DTYPE(temp_state_u, kHalf);
+    TORCH_CHECK_DTYPE(temp_state_d, kFloat);
     TORCH_CHECK_DIM(temp_state_g, 3);
+    TORCH_CHECK_DIM(temp_state_d, 3);
     TORCH_CHECK_SHAPES(temp_state_g, 2, hidden_state, 1, 1);
     TORCH_CHECK_SHAPES_FULL(temp_state_g, temp_state_u);
+    TORCH_CHECK_SHAPES(temp_state_d, 0, temp_state_g, 0, 1);
+    TORCH_CHECK_SHAPES(temp_state_d, 1, temp_state_g, 1, 1);
+    TORCH_CHECK_SHAPES(temp_state_d, 2, temp_state_g, 2, 1);
     size_t max_tokens_per_expert = temp_state_g.size(1);
     size_t concurrency = temp_state_g.size(0);
 
@@ -239,6 +251,7 @@ void exl3_moe
     void* _hidden_state = hidden_state.data_ptr();
     void* _temp_state_g = temp_state_g.data_ptr();
     void* _temp_state_u = temp_state_u.data_ptr();
+    void* _temp_state_d = temp_state_d.data_ptr();
     void* _temp_intermediate_g = temp_intermediate_g.data_ptr();
     void* _temp_intermediate_u = temp_intermediate_u.data_ptr();
     void* _output_state = output_state.data_ptr();
@@ -262,6 +275,7 @@ void exl3_moe
         &_hidden_state,
         &_temp_state_g,
         &_temp_state_u,
+        &_temp_state_d,
         &_temp_intermediate_g,
         &_temp_intermediate_u,
         &_output_state,
@@ -288,7 +302,8 @@ void exl3_moe
         (void*) &K_gate,
         (void*) &K_up,
         (void*) &K_down,
-        (void*) &locks
+        (void*) &locks,
+        (void*) &direct_output
     };
 
     cudaLaunchKernel

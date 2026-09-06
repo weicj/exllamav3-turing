@@ -11,7 +11,10 @@ from exllamav3 import Cache, Config, Generator, Job, Model, Tokenizer
 from exllamav3.generator.sampler import GreedySampler
 
 
-MODEL_DIR = "/mnt/nvme/models/turboderp-Qwen3.8-Flash-Next-exl3/2.05bpw_h4_ng4"
+MODEL_DIR = os.environ.get(
+    "BENCH_MODEL_DIR",
+    "/mnt/nvme/models/turboderp-Qwen3.8-Flash-Next-exl3/2.05bpw_h4_ng4",
+)
 PROMPT_TOKENS = 4096
 OUTPUT_TOKENS = int(os.environ.get("BENCH_OUTPUT_TOKENS", "128"))
 CACHE_TOKENS = 4608
@@ -22,6 +25,24 @@ TP_BACKEND = os.environ.get("BENCH_TP_BACKEND", "nccl")
 LOGITS_PATH = os.environ.get("BENCH_LOGITS_PATH")
 CAPTURE_TOKENS = os.environ.get("BENCH_CAPTURE_TOKENS") == "1"
 CAPTURE_TOKEN_IDS = os.environ.get("BENCH_CAPTURE_TOKEN_IDS") == "1"
+REPEAT_COUNT = int(os.environ.get("BENCH_REPEAT_COUNT", "1"))
+
+
+def runtime_toggles():
+    """Record every performance knob that can change the measured execution path."""
+    names = (
+        "EXL3_BC_ATTN",
+        "EXL3_FLASHINFER",
+        "EXL3_FLASHINFER_WORKSPACE_MB",
+        "EXL3_GEMV",
+        "EXL3_INT8_GEMV",
+        "EXL3_MGEMM_K_THRESHOLD",
+        "EXL3_MGEMM_N_THRESHOLD",
+        "EXL3_QSA_DISABLE_SPARSE",
+        "EXL3_QSA_PREFILL_DENSE",
+        "EXL3_QSA_BC_FORCE_DENSE",
+    )
+    return {name: os.environ.get(name, "<default>") for name in names}
 
 
 def run_job(generator, prompt_tokens, output_tokens, seed):
@@ -50,6 +71,16 @@ def run_job(generator, prompt_tokens, output_tokens, seed):
     if CAPTURE_TOKENS:
         finished["_bench_token_ids"] = captured_tokens
     return finished
+
+
+def clear_request_cache(generator):
+    """Make each measured request start from fresh KV and recurrent state."""
+    assert not generator.active_jobs
+    if generator.recurrent_cache is not None:
+        generator.recurrent_cache.clear()
+    for page in generator.pagetable.all_pages:
+        assert page.ref_count == 0
+        page.clear()
 
 
 def main():
@@ -90,8 +121,16 @@ def main():
             max_chunk_size=CHUNK_TOKENS,
         )
 
+        if REPEAT_COUNT <= 0:
+            raise ValueError("BENCH_REPEAT_COUNT must be positive")
+
         warmup = run_job(generator, 128, 8, 1)
-        result = run_job(generator, PROMPT_TOKENS, OUTPUT_TOKENS, 2)
+        clear_request_cache(generator)
+        results = []
+        for repeat in range(REPEAT_COUNT):
+            results.append(run_job(generator, PROMPT_TOKENS, OUTPUT_TOKENS, 2 + repeat))
+            clear_request_cache(generator)
+        result = results[-1]
         measured_prompt = PROMPT_TOKENS
         generated = result["new_tokens"]
         report = {
@@ -105,11 +144,24 @@ def main():
             "prompt_tokens_measured": measured_prompt,
             "output_tokens_requested": OUTPUT_TOKENS,
             "output_tokens_measured": generated,
+            "repeat_count": REPEAT_COUNT,
             "cache_tokens": CACHE_TOKENS,
             "prefill_chunk_tokens": CHUNK_TOKENS,
             "loader_chunk_tokens": LOAD_CHUNK_TOKENS,
             "use_per_device_gib": USE_PER_DEVICE,
             "load_seconds": load_seconds,
+            "runtime_toggles": runtime_toggles(),
+            "runs": [
+                {
+                    "prefill_seconds": run["time_prefill"],
+                    "decode_seconds": run["time_generate"],
+                    "prefill_tok_s": measured_prompt / run["time_prefill"],
+                    "decode_tok_s": run["new_tokens"] / run["time_generate"],
+                    "output_tokens": run["new_tokens"],
+                }
+                for run in results
+            ],
+            # Keep the historical top-level fields as the last sample for existing parsers.
             "prefill_seconds": result["time_prefill"],
             "decode_seconds": result["time_generate"],
             "prefill_tok_s": measured_prompt / result["time_prefill"],

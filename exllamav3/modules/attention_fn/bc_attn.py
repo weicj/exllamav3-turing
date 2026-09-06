@@ -40,6 +40,10 @@ while building the path raise.
 """
 
 bc_attn_enable = os.environ.get("EXL3_BC_ATTN", "1") != "0"
+# Diagnostic policy switch: retain the armed QSA cache-plane updates and BC graph but use its
+# dense attention slot beyond the normal sparse threshold. Unlike EXL3_QSA_DISABLE_SPARSE, this
+# does not force the whole attention module back to eager execution.
+_qsa_bc_force_dense = os.environ.get("EXL3_QSA_BC_FORCE_DENSE", "0") != "0"
 
 # EXL3_BC_ATTN_TRACE=1: print build/decline per module/layer (activation check for A/B tests)
 _bc_trace = os.environ.get("EXL3_BC_ATTN_TRACE", "0") != "0"
@@ -574,7 +578,7 @@ class BCAttn:
         if self.qsa:
             assert host_seqlens is not None, "BC_Attention: QSA step requires host seqlens"
             t_total = int(host_seqlens.max().item()) + q_len
-            if t_total > self.qsa_threshold:
+            if t_total > self.qsa_threshold and not _qsa_bc_force_dense:
                 # sparse slots are single-job; every query row of the chunk gets its own
                 # selection (MTP-verify shapes included)
                 if bsz > 1 or not causal:

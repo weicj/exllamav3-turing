@@ -26,6 +26,7 @@
     const half* __restrict__ hidden_state,      \
     half* __restrict__ temp_state_g,            \
     half* __restrict__ temp_state_u,            \
+    float* __restrict__ temp_state_d,           \
     half* __restrict__ temp_intermediate_g,     \
     half* __restrict__ temp_intermediate_u,     \
     float* __restrict__ output_state,           \
@@ -56,4 +57,5 @@
     const int K_up,                             \
     const int K_down,                           \
                                                 \
-    int* __restrict__ locks
+    int* __restrict__ locks,                   \
+    const bool direct_output

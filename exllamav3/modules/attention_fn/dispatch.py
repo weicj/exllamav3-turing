@@ -35,6 +35,7 @@ _force_torch_layers = {
     for value in os.environ.get("EXL3_ATTN_FORCE_TORCH_LAYERS", "").split(",")
     if value
 }
+_dispatch_trace_seen = set()
 
 _fns_triton_fast: list[AttnFn] = [
     fn_triton_paged_attn_decode,
@@ -221,6 +222,22 @@ def attn_dispatch(
             raise ValueError("No matching attention function")
         if dispatch_cache is not None:
             dispatch_cache[hint_key] = fn
+
+    if os.environ.get("EXL3_ATTN_DISPATCH_TRACE", "0") != "0":
+        trace_key = (
+            fn.__name__, args.q.device.index, args.bsz, args.q_len,
+            args.num_q_heads, args.num_kv_heads, args.dim,
+            args.has_kv_cache(), args.q_cache is not None,
+        )
+        if trace_key not in _dispatch_trace_seen:
+            _dispatch_trace_seen.add(trace_key)
+            print(
+                f"ATTN_BACKEND backend={fn.__name__} device={args.q.device.index} "
+                f"bsz={args.bsz} q_len={args.q_len} q_heads={args.num_q_heads} "
+                f"kv_heads={args.num_kv_heads} dim={args.dim} "
+                f"cache={args.has_kv_cache()} quant_direct={args.q_cache is not None}",
+                flush = True,
+            )
 
     # Update cache (quant-direct mode already wrote the new K/V before the attention call)
     if cache is not None and q_cache is None:

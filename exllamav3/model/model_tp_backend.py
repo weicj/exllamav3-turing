@@ -152,7 +152,13 @@ class TPBackendNCCL:
             end = torch.cuda.Event(enable_timing=True)
             start.record()
             host_start = time.perf_counter()
-        dist.all_reduce(tensor, async_op = False)
+        # Enqueue NCCL work without synchronously waiting in Python.  All model kernels
+        # and collectives run on the owning CUDA stream, so stream ordering preserves the
+        # dependency on the reduced tensor; the worker's end-of-forward CUDA fence still
+        # provides the lifetime/ack safety boundary.  Keep the historical blocking path as
+        # the default and expose this strictly as an opt-in performance experiment.
+        async_reduce = os.environ.get("EXL3_TP_ASYNC_ALLREDUCE", "0") == "1"
+        dist.all_reduce(tensor, async_op = async_reduce)
         if self.profile_dir:
             host_ms = (time.perf_counter() - host_start) * 1e3
             end.record()
@@ -496,7 +502,8 @@ class TPBackendNative:
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
-        # if tensor.numel() * 2 < MAX_CPU_REDUCE:
+        # CPU-assisted path: the wire format and helper scheduling are kept
+        # unchanged for the established native backend.
         ext.pg_all_reduce_cpu(
             self.ptr_g,
             self.dev_g,

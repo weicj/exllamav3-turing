@@ -13,8 +13,8 @@ from exllamav3.generator.sampler import GreedySampler
 MODEL_DIR = "/mnt/nvme/models/turboderp-Qwen3.8-Flash-Next-exl3/2.05bpw_h4_ng4"
 PROMPT_TOKENS = 4096
 CACHE_TOKENS = 4608
-CHUNK_TOKENS = 512
-LOAD_CHUNK_TOKENS = 256
+CHUNK_TOKENS = int(os.environ.get("BENCH_CHUNK_TOKENS", "512"))
+LOAD_CHUNK_TOKENS = int(os.environ.get("BENCH_LOAD_CHUNK_TOKENS", "256"))
 USE_PER_DEVICE = [22.0, 22.0]
 
 
