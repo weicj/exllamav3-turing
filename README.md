@@ -7,6 +7,10 @@
 > Quadro RTX now run EXL3. See [doc/sm75.md](doc/sm75.md) for what was changed and what it
 > costs. Everything below is upstream documentation.
 
+The four-GPU EXL3 quality smoke is in `tools/tp4_exl3_smoke.py`. It requires
+`EXL3_NGRAM_STREAM=1`; optional vLLM plugin registration is explicit through
+`VLLM_EXL3_EXPERIMENT_BOOTSTRAP=1`.
+
 ExLlamaV3 is an inference library for running local LLMs on modern consumer GPUs. Headline features:
 
 - New [EXL3](doc/exl3.md) quantization format based on QTIP
